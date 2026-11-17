@@ -112,11 +112,81 @@ public class Module implements IXposedHookLoadPackage {
         return isUserInLockdownMethod != null && (boolean) isUserInLockdownMethod.invoke(kum, Util.INSTANCE.getCurrentUser());
     }
 
-        private void addHookEarlyUnlock(Class<?> kumClazz, XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+            private Object cachedKum;
+    private Object cachedStatusBar;
+    private Class<?> cachedStatusBarClass;
+
+    private void setLockscreenUnlocked(boolean unlocked) {
+        if (cachedKum == null) return;
+        try {
+            int userId = 0;
+            try {
+                Method getCurrentUser = android.app.ActivityManager.class.getMethod("getCurrentUser");
+                userId = (int) getCurrentUser.invoke(null);
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                Field trustField = asAccessible(cachedKum.getClass().getDeclaredField("mUserHasTrust"));
+                android.util.SparseBooleanArray trustArray = (android.util.SparseBooleanArray) trustField.get(cachedKum);
+                if (trustArray != null) {
+                    trustArray.put(userId, unlocked);
+                }
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                Method onTrustChanged = asAccessible(cachedKum.getClass().getDeclaredMethod(
+                        "onTrustChanged", boolean.class, boolean.class, int.class, int.class, java.util.List.class));
+                onTrustChanged.invoke(cachedKum, unlocked, unlocked, userId, 0, null);
+            } catch (Throwable t1) {
+                try {
+                    Method sendUpdates = asAccessible(cachedKum.getClass().getDeclaredMethod("sendUpdates", int.class));
+                    sendUpdates.invoke(cachedKum, userId);
+                } catch (Throwable ignored) {
+                }
+            }
+
+            if (cachedStatusBar != null) {
+                try {
+                    Field kscField = asAccessible(cachedStatusBarClass.getDeclaredField("mKeyguardStateController"));
+                    Object ksc = kscField.get(cachedStatusBar);
+                    if (ksc != null) {
+                        try {
+                            Method updateMethod = asAccessible(ksc.getClass().getDeclaredMethod("update", boolean.class));
+                            updateMethod.invoke(ksc, true);
+                        } catch (Throwable t2) {
+                            Method notifyMethod = asAccessible(ksc.getClass().getDeclaredMethod(
+                                    "notifyKeyguardState", boolean.class, boolean.class));
+                            notifyMethod.invoke(ksc, true, false);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable th) {
+            XposedBridge.log(th);
+        }
+    }
+
+    private boolean isBouncerShowing() {
+        if (cachedStatusBar == null || cachedStatusBarClass == null) return false;
+        try {
+            Field vmField = asAccessible(cachedStatusBarClass.getDeclaredField("mStatusBarKeyguardViewManager"));
+            Object vm = vmField.get(cachedStatusBar);
+            if (vm != null) {
+                Method isShowing = asAccessible(vm.getClass().getMethod("isBouncerShowing"));
+                return (boolean) isShowing.invoke(vm);
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void addHookEarlyUnlock(Class<?> kumClazz, XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         Field mStatusBarStateControllerField = asAccessible(kumClazz.getDeclaredField("mStatusBarStateController"));
         Field mKeyguardIsVisibleField;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+
             mKeyguardIsVisibleField = asAccessible(kumClazz.getDeclaredField("mKeyguardShowing"));
         } else {
             mKeyguardIsVisibleField = asAccessible(kumClazz.getDeclaredField("mKeyguardIsVisible"));
@@ -137,6 +207,7 @@ public class Module implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 Object kum = param.thisObject;
+                cachedKum = kum;
                 if (isUserInLockdown(kum)) {
                     return;
                 }
@@ -147,7 +218,6 @@ public class Module implements IXposedHookLoadPackage {
                 boolean mGoingToSleep = mGoingToSleepField.getBoolean(kum);
                 int sbscState = (int) getStateMethod.invoke(sbsc);
 
-                // From: com.android.keyguard.KeyguardUpdateMonitor.shouldListenForFace
                 final boolean statusBarShadeLocked = sbscState == SHADE_LOCKED;
                 final boolean awakeKeyguard = mKeyguardIsVisible && mDeviceInteractive && !mGoingToSleep && !statusBarShadeLocked;
 
@@ -161,11 +231,9 @@ public class Module implements IXposedHookLoadPackage {
         };
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
-            // Android 12L+
             try {
                 XposedHelpers.findAndHookMethod(kumClazz, "updateFaceListeningState", int.class, hook);
             } catch (Throwable th) {
-                // hook the fingerprint for some ROMs
                 XposedHelpers.findAndHookMethod(kumClazz, "updateFingerprintListeningState", int.class, hook);
             }
         } else {
@@ -178,6 +246,7 @@ public class Module implements IXposedHookLoadPackage {
             FaceIdOverlay.showScanning(context);
         } else {
             FaceIdOverlay.hide();
+            setLockscreenUnlocked(false);
         }
         context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK).putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, newAwakeKeyguard));
     }
@@ -198,32 +267,37 @@ public class Module implements IXposedHookLoadPackage {
     @SuppressLint("PrivateApi")
     private void hookStatusBar(Class<?> statusBarClass, ClassLoader classLoader, XC_MethodHook.MethodHookParam param) throws Throwable {
         Object statusBar = param.thisObject;
+        cachedStatusBar = statusBar;
+        cachedStatusBarClass = statusBarClass;
+
         Class<?> systemUiClass;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // >= Android 14: Same as SystemUi
             systemUiClass = classLoader.loadClass(CENTRAL_SURFACES_IMPL_CLASS);
         } else if (Build.VERSION.SDK_INT > Build.VERSION_CODES.S_V2) {
-            // >= Android 13
             systemUiClass = classLoader.loadClass(CORE_STARTABLE_CLASS);
         } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.S_V2) {
-            // == Android 12L
             try {
                 systemUiClass = classLoader.loadClass(SYSTEM_UI_CLASS);
             } catch (ClassNotFoundException ex) {
                 systemUiClass = classLoader.loadClass(CORE_STARTABLE_CLASS);
             }
         } else {
-            // <= Android 12
             systemUiClass = classLoader.loadClass(SYSTEM_UI_CLASS);
         }
         Context context = (Context) asAccessible(systemUiClass.getDeclaredField("mContext")).get(statusBar);
         Object kum = asAccessible(statusBarClass.getDeclaredField("mKeyguardUpdateMonitor")).get(statusBar);
+        cachedKum = kum;
+
+        UnlockMethod method = hookStatusBarBiometricUnlock(classLoader, statusBar, statusBarClass);
 
         UnlockReceiver.INSTANCE.setup(context, statusBar, intent -> {
             try {
                 if (!isUserInLockdown(kum)) {
-                    // تشغيل أنميشن نجاح Face ID وإبقاء شاشة القفل ظاهرة حتى السحب
                     FaceIdOverlay.showSuccess(context);
+                    setLockscreenUnlocked(true);
+                    if (isBouncerShowing()) {
+                        method.unlock(intent);
+                    }
                 }
             } catch (Throwable throwable) {
                 throw new RuntimeException(throwable);
@@ -263,4 +337,3 @@ public class Module implements IXposedHookLoadPackage {
         };
     }
 }
-
