@@ -112,11 +112,11 @@ public class Module implements IXposedHookLoadPackage {
         return isUserInLockdownMethod != null && (boolean) isUserInLockdownMethod.invoke(kum, Util.INSTANCE.getCurrentUser());
     }
 
-    private void addHookEarlyUnlock(Class<?> kumClazz, XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+        private void addHookEarlyUnlock(Class<?> kumClazz, XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         Field mStatusBarStateControllerField = asAccessible(kumClazz.getDeclaredField("mStatusBarStateController"));
         Field mKeyguardIsVisibleField;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14
+            // Android 14+
             mKeyguardIsVisibleField = asAccessible(kumClazz.getDeclaredField("mKeyguardShowing"));
         } else {
             mKeyguardIsVisibleField = asAccessible(kumClazz.getDeclaredField("mKeyguardIsVisible"));
@@ -168,13 +168,17 @@ public class Module implements IXposedHookLoadPackage {
                 // hook the fingerprint for some ROMs
                 XposedHelpers.findAndHookMethod(kumClazz, "updateFingerprintListeningState", int.class, hook);
             }
-
         } else {
             XposedHelpers.findAndHookMethod(kumClazz, "updateFaceListeningState", hook);
         }
     }
 
     private void hookEarlyUnlock(Context context, boolean newAwakeKeyguard) throws Throwable {
+        if (newAwakeKeyguard) {
+            FaceIdOverlay.showScanning(context);
+        } else {
+            FaceIdOverlay.hide();
+        }
         context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK).putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, newAwakeKeyguard));
     }
 
@@ -204,11 +208,8 @@ public class Module implements IXposedHookLoadPackage {
         } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.S_V2) {
             // == Android 12L
             try {
-                // Try loading SystemUI class for Android 12L
                 systemUiClass = classLoader.loadClass(SYSTEM_UI_CLASS);
             } catch (ClassNotFoundException ex) {
-                // We are on Android 13 DP (same API level as 12L: https://issuetracker.google.com/issues/36973990#comment2)
-                // Load Android 13 class
                 systemUiClass = classLoader.loadClass(CORE_STARTABLE_CLASS);
             }
         } else {
@@ -218,12 +219,11 @@ public class Module implements IXposedHookLoadPackage {
         Context context = (Context) asAccessible(systemUiClass.getDeclaredField("mContext")).get(statusBar);
         Object kum = asAccessible(statusBarClass.getDeclaredField("mKeyguardUpdateMonitor")).get(statusBar);
 
-        UnlockMethod method = hookStatusBarBiometricUnlock(classLoader, statusBar, statusBarClass);
-
         UnlockReceiver.INSTANCE.setup(context, statusBar, intent -> {
             try {
                 if (!isUserInLockdown(kum)) {
-                    method.unlock(intent);
+                    // تشغيل أنميشن نجاح Face ID وإبقاء شاشة القفل ظاهرة حتى السحب
+                    FaceIdOverlay.showSuccess(context);
                 }
             } catch (Throwable throwable) {
                 throw new RuntimeException(throwable);
@@ -263,3 +263,4 @@ public class Module implements IXposedHookLoadPackage {
         };
     }
 }
+
