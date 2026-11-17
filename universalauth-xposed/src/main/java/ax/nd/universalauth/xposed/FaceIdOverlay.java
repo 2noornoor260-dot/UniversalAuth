@@ -12,6 +12,10 @@ import android.graphics.Path;
 import android.graphics.PathMeasure;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
@@ -36,10 +40,16 @@ public class FaceIdOverlay extends View {
     private static final int STATE_SUCCESS = 1;
     private static final int STATE_FAILURE = 2;
 
-    private static final long WAKE_APPEAR_DELAY_MS = 135L;
-    private static final long SCAN_TIMEOUT_MS = 4500L;
+    private static final long WAKE_APPEAR_DELAY_MS = 120L;
+    private static final long SCAN_TIMEOUT_MS = 5200L;
+    private static final float DARK_LUX_THRESHOLD = 8.0f; // يعمل فقط في الظلام الحقيقي
 
     private static FaceIdOverlay instance;
+    private static View fillLightView;
+    private static SensorManager lightSensorManager;
+    private static SensorEventListener lightSensorListener;
+    private static boolean fillLightTriggered = false;
+
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private static final Runnable timeoutRunnable = () -> {
@@ -54,7 +64,6 @@ public class FaceIdOverlay extends View {
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint glyphPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF pillRect = new RectF();
-    private final RectF eyeRect = new RectF();
     private final RectF mouthRect = new RectF();
     private final Path nosePath = new Path();
     private final Path checkPath = new Path();
@@ -110,11 +119,13 @@ public class FaceIdOverlay extends View {
             WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
             if (wm == null) return;
 
+            startAmbientLightCheck(appCtx);
+
             FaceIdOverlay view = new FaceIdOverlay(appCtx);
             int sizePx = dp(appCtx, 68);
 
             int[] windowTypes = new int[]{
-                    2024, // TYPE_NAVIGATION_BAR_PANEL (فوق شاشة القفل)
+                    2024, // TYPE_NAVIGATION_BAR_PANEL
                     2015, // TYPE_SECURE_SYSTEM_OVERLAY
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             };
@@ -133,11 +144,7 @@ public class FaceIdOverlay extends View {
                                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
                             PixelFormat.TRANSLUCENT
                     );
-                    try {
-                        Field privateFlags = WindowManager.LayoutParams.class.getField("privateFlags");
-                        privateFlags.setInt(params, privateFlags.getInt(params) | 0x00000010);
-                    } catch (Throwable ignored) {
-                    }
+                    applyTrustedOverlayFlag(params);
 
                     view.layoutParams = params;
                     view.updateCameraPosition(appCtx, false);
@@ -162,6 +169,170 @@ public class FaceIdOverlay extends View {
         }
     }
 
+    public static void triggerRetryPulse() {
+        mainHandler.post(() -> {
+            if (instance != null && instance.state == STATE_SCANNING && instance.isAttachedToWindow()) {
+                instance.animate()
+                        .scaleX(0.88f)
+                        .scaleY(0.88f)
+                        .setDuration(100)
+                        .withEndAction(() -> {
+                            if (instance != null && instance.isAttachedToWindow()) {
+                                instance.animate()
+                                        .scaleX(1.05f)
+                                        .scaleY(1.05f)
+                                        .setDuration(130)
+                                        .withEndAction(() -> {
+                                            if (instance != null && instance.isAttachedToWindow()) {
+                                                instance.animate().scaleX(1f).scaleY(1f).setDuration(110).start();
+                                            }
+                                        })
+                                        .start();
+                            }
+                        })
+                        .start();
+            }
+        });
+    }
+
+    private static void startAmbientLightCheck(Context appCtx) {
+        stopAmbientLightCheck();
+        fillLightTriggered = false;
+        try {
+            lightSensorManager = (SensorManager) appCtx.getSystemService(Context.SENSOR_SERVICE);
+            if (lightSensorManager == null) return;
+            Sensor lightSensor = lightSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+            if (lightSensor == null) return;
+
+            lightSensorListener = new SensorEventListener() {
+                @Override
+                public void onSensorChanged(SensorEvent event) {
+                    if (event.values != null && event.values.length > 0) {
+                        float lux = event.values[0];
+                        if (lux <= DARK_LUX_THRESHOLD && !fillLightTriggered && instance != null && instance.state == STATE_SCANNING) {
+                            fillLightTriggered = true;
+                            showSmoothFillLight(appCtx);
+                        }
+                        stopAmbientLightCheck();
+                    }
+                }
+
+                @Override
+                public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                }
+            };
+            lightSensorManager.registerListener(lightSensorListener, lightSensor, SensorManager.SENSOR_DELAY_FASTEST);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void stopAmbientLightCheck() {
+        if (lightSensorManager != null && lightSensorListener != null) {
+            try {
+                lightSensorManager.unregisterListener(lightSensorListener);
+            } catch (Throwable ignored) {
+            }
+        }
+        lightSensorListener = null;
+    }
+
+    private static void showSmoothFillLight(Context appCtx) {
+        mainHandler.post(() -> {
+            try {
+                if (fillLightView != null || instance == null || instance.state != STATE_SCANNING) return;
+                WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
+                if (wm == null) return;
+
+                View lightPanel = new View(appCtx);
+                lightPanel.setBackgroundColor(Color.parseColor("#FFF8EE"));
+                lightPanel.setAlpha(0f);
+
+                int[] windowTypes = new int[]{
+                        2024,
+                        2015,
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                };
+
+                for (int type : windowTypes) {
+                    try {
+                        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                                WindowManager.LayoutParams.MATCH_PARENT,
+                                WindowManager.LayoutParams.MATCH_PARENT,
+                                type,
+                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                                PixelFormat.TRANSLUCENT
+                        );
+                        applyTrustedOverlayFlag(params);
+
+                        wm.addView(lightPanel, params);
+                        fillLightView = lightPanel;
+
+                        if (instance != null && instance.isAttachedToWindow()) {
+                            wm.removeViewImmediate(instance);
+                            wm.addView(instance, instance.layoutParams);
+                        }
+
+                        lightPanel.animate()
+                                .alpha(0.52f)
+                                .setDuration(480)
+                                .setInterpolator(new DecelerateInterpolator())
+                                .start();
+                        break;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    private static void hideSmoothFillLight(boolean immediate) {
+        if (fillLightView == null) return;
+        View panel = fillLightView;
+        fillLightView = null;
+
+        if (immediate) {
+            try {
+                WindowManager wm = (WindowManager) panel.getContext().getSystemService(Context.WINDOW_SERVICE);
+                if (wm != null && panel.isAttachedToWindow()) {
+                    wm.removeView(panel);
+                }
+            } catch (Throwable ignored) {
+            }
+            return;
+        }
+
+        panel.animate()
+                .alpha(0f)
+                .setDuration(300)
+                .setInterpolator(new DecelerateInterpolator())
+                .setListener(new AnimatorListenerAdapter() {
+                    @Override
+                    public void onAnimationEnd(Animator animation) {
+                        try {
+                            WindowManager wm = (WindowManager) panel.getContext().getSystemService(Context.WINDOW_SERVICE);
+                            if (wm != null && panel.isAttachedToWindow()) {
+                                wm.removeView(panel);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                })
+                .start();
+    }
+
+    private static void applyTrustedOverlayFlag(WindowManager.LayoutParams params) {
+        try {
+            Field privateFlags = WindowManager.LayoutParams.class.getField("privateFlags");
+            privateFlags.setInt(params, privateFlags.getInt(params) | 0x00000010);
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void showSuccess(Context context) {
         if (context == null) return;
         mainHandler.post(() -> {
@@ -170,6 +341,8 @@ public class FaceIdOverlay extends View {
                 pendingShowRunnable = null;
             }
             mainHandler.removeCallbacks(timeoutRunnable);
+            stopAmbientLightCheck();
+            hideSmoothFillLight(false);
 
             if (instance == null || !instance.isAttachedToWindow()) {
                 showScanningInternal(context);
@@ -188,6 +361,8 @@ public class FaceIdOverlay extends View {
                 pendingShowRunnable = null;
             }
             mainHandler.removeCallbacks(timeoutRunnable);
+            stopAmbientLightCheck();
+            hideSmoothFillLight(false);
 
             if (instance != null && instance.isAttachedToWindow()) {
                 instance.triggerFailureAnimation();
@@ -202,6 +377,8 @@ public class FaceIdOverlay extends View {
                 pendingShowRunnable = null;
             }
             mainHandler.removeCallbacks(timeoutRunnable);
+            stopAmbientLightCheck();
+            hideSmoothFillLight(false);
 
             if (instance != null && (instance.state == STATE_SUCCESS || instance.state == STATE_FAILURE)) {
                 return;
@@ -231,13 +408,11 @@ public class FaceIdOverlay extends View {
         } catch (Throwable ignored) {
         }
 
-        // محاذاة موقع الكاميرا الأمامية لتابلت Samsung SM-T505N في جميع الاتجاهات
         int effectiveRotation = naturalPortrait ? rotation : ((rotation + 1) % 4);
         int marginFromBezel = dp(ctx, 18);
 
         switch (effectiveRotation) {
             case Surface.ROTATION_0:
-                // الوضع الطولي: الكاميرا في منتصف الحافة اليمنى
                 edgeGravity = Gravity.RIGHT;
                 layoutParams.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL;
                 layoutParams.x = marginFromBezel;
@@ -245,7 +420,6 @@ public class FaceIdOverlay extends View {
                 break;
 
             case Surface.ROTATION_180:
-                // الوضع الطولي المقلوب: الكاميرا في منتصف الحافة اليسرى
                 edgeGravity = Gravity.LEFT;
                 layoutParams.gravity = Gravity.LEFT | Gravity.CENTER_VERTICAL;
                 layoutParams.x = marginFromBezel;
@@ -253,7 +427,6 @@ public class FaceIdOverlay extends View {
                 break;
 
             case Surface.ROTATION_270:
-                // الوضع الأفقي المعكوس: الكاميرا في منتصف الحافة السفلية
                 edgeGravity = Gravity.BOTTOM;
                 layoutParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
                 layoutParams.x = 0;
@@ -262,7 +435,6 @@ public class FaceIdOverlay extends View {
 
             case Surface.ROTATION_90:
             default:
-                // الوضع الأفقي القياسي: الكاميرا في منتصف الحافة العلوية
                 edgeGravity = Gravity.TOP;
                 layoutParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
                 layoutParams.x = 0;
@@ -341,8 +513,8 @@ public class FaceIdOverlay extends View {
                 .alpha(1f)
                 .translationX(0f)
                 .translationY(0f)
-                .setDuration(340)
-                .setInterpolator(new OvershootInterpolator(1.35f))
+                .setDuration(320)
+                .setInterpolator(new OvershootInterpolator(1.3f))
                 .start();
     }
 
@@ -361,6 +533,8 @@ public class FaceIdOverlay extends View {
     private void triggerSuccessAnimation() {
         if (state == STATE_SUCCESS) return;
         state = STATE_SUCCESS;
+        stopAmbientLightCheck();
+        hideSmoothFillLight(false);
         if (scanAnimator != null) scanAnimator.cancel();
         if (stateAnimator != null) stateAnimator.cancel();
 
@@ -369,13 +543,13 @@ public class FaceIdOverlay extends View {
         animate()
                 .scaleX(1.12f)
                 .scaleY(1.12f)
-                .setDuration(170)
+                .setDuration(160)
                 .setInterpolator(new DecelerateInterpolator())
-                .withEndAction(() -> animate().scaleX(1f).scaleY(1f).setDuration(180).start())
+                .withEndAction(() -> animate().scaleX(1f).scaleY(1f).setDuration(170).start())
                 .start();
 
         stateAnimator = ValueAnimator.ofFloat(0f, 1f);
-        stateAnimator.setDuration(380);
+        stateAnimator.setDuration(360);
         stateAnimator.setInterpolator(new DecelerateInterpolator());
         stateAnimator.addUpdateListener(anim -> {
             float v = (float) anim.getAnimatedValue();
@@ -385,30 +559,31 @@ public class FaceIdOverlay extends View {
         });
         stateAnimator.start();
 
-        mainHandler.postDelayed(() -> removeInternal(false), 1050);
+        mainHandler.postDelayed(() -> removeInternal(false), 1000);
     }
 
     private void triggerFailureAnimation() {
         if (state != STATE_SCANNING) return;
         state = STATE_FAILURE;
+        stopAmbientLightCheck();
+        hideSmoothFillLight(false);
         if (scanAnimator != null) scanAnimator.cancel();
         if (stateAnimator != null) stateAnimator.cancel();
 
         vibrateHaptic(true);
         invalidate();
 
-        // اهتزاز أفقي مطابق لفشل Face ID في آيفون
         float d = dp(getContext(), 10);
         ObjectAnimator shake = ObjectAnimator.ofFloat(
                 this,
                 "translationX",
                 0f, -d, d, -d * 0.75f, d * 0.75f, -d * 0.35f, d * 0.35f, 0f
         );
-        shake.setDuration(420);
+        shake.setDuration(400);
         shake.setInterpolator(new DecelerateInterpolator());
         shake.start();
 
-        mainHandler.postDelayed(() -> removeInternal(false), 780);
+        mainHandler.postDelayed(() -> removeInternal(false), 750);
     }
 
     private void vibrateHaptic(boolean isError) {
@@ -426,6 +601,8 @@ public class FaceIdOverlay extends View {
     }
 
     private static void removeInternal(boolean immediate) {
+        stopAmbientLightCheck();
+        hideSmoothFillLight(immediate);
         if (instance == null) return;
         FaceIdOverlay view = instance;
         instance = null;
@@ -458,7 +635,7 @@ public class FaceIdOverlay extends View {
                 .alpha(0f)
                 .translationX(endTx)
                 .translationY(endTy)
-                .setDuration(240)
+                .setDuration(230)
                 .setInterpolator(new DecelerateInterpolator())
                 .setListener(new AnimatorListenerAdapter() {
                     @Override
@@ -492,7 +669,6 @@ public class FaceIdOverlay extends View {
         float cy = h / 2f;
 
         if (state == STATE_SUCCESS) {
-            // حلقة النجاح الخضراء وعلامة الصح المتحركة
             glyphPaint.setColor(Color.parseColor("#34C759"));
             glyphPaint.setAlpha(255);
             glyphPaint.setStrokeWidth(dp(getContext(), 2.8f));
@@ -523,16 +699,13 @@ public class FaceIdOverlay extends View {
         glyphPaint.setAlpha(255);
         glyphPaint.setStrokeWidth(dp(getContext(), 2.3f));
 
-        // رسم الزوايا الأربع لإطار Face ID
         drawCornerBrackets(canvas, cx, cy, boxHalf, bracketLen, arcR);
 
-        // رسم ملامح وجه Face ID بحركة نظرة ناعمة
         float fcx = cx + lookX;
         float fcy = cy + lookY;
         float eyeOffsetX = dp(getContext(), 5.2f);
         float eyeOffsetY = dp(getContext(), 3.2f);
 
-        // حركة رمش طبيعية خفيفة أثناء المسح
         float blinkFactor = (!isFail && Math.sin(scanAngle) > 0.94f) ? 0.25f : 1f;
         float eyeHalfH = dp(getContext(), 2.1f) * blinkFactor;
 
@@ -542,7 +715,6 @@ public class FaceIdOverlay extends View {
         canvas.drawLine(fcx + eyeOffsetX, fcy - eyeOffsetY - eyeHalfH,
                 fcx + eyeOffsetX, fcy - eyeOffsetY + eyeHalfH, glyphPaint);
 
-        // الأنف
         nosePath.reset();
         nosePath.moveTo(fcx + dp(getContext(), 0.3f), fcy - dp(getContext(), 2.2f));
         nosePath.lineTo(fcx + dp(getContext(), 0.3f), fcy + dp(getContext(), 1.6f));
@@ -550,7 +722,6 @@ public class FaceIdOverlay extends View {
         glyphPaint.setStrokeWidth(dp(getContext(), 1.9f));
         canvas.drawPath(nosePath, glyphPaint);
 
-        // الفم (ابتسامة عند المسح، أو خط/انحناء حزين عند الفشل)
         glyphPaint.setStrokeWidth(dp(getContext(), 2.1f));
         if (!isFail) {
             mouthRect.set(
@@ -577,7 +748,6 @@ public class FaceIdOverlay extends View {
         float ri = cx + half;
         float b = cy + half;
 
-        // أعلى اليسار
         Path p = new Path();
         p.moveTo(l, t + len);
         p.lineTo(l, t + r);
@@ -585,7 +755,6 @@ public class FaceIdOverlay extends View {
         p.lineTo(l + len, t);
         canvas.drawPath(p, glyphPaint);
 
-        // أعلى اليمين
         p.reset();
         p.moveTo(ri - len, t);
         p.lineTo(ri - r, t);
@@ -593,7 +762,6 @@ public class FaceIdOverlay extends View {
         p.lineTo(ri, t + len);
         canvas.drawPath(p, glyphPaint);
 
-        // أسفل اليسار
         p.reset();
         p.moveTo(l, b - len);
         p.lineTo(l, b - r);
@@ -601,7 +769,6 @@ public class FaceIdOverlay extends View {
         p.lineTo(l + len, b);
         canvas.drawPath(p, glyphPaint);
 
-        // أسفل اليمين
         p.reset();
         p.moveTo(ri - len, b);
         p.lineTo(ri - r, b);
@@ -613,4 +780,4 @@ public class FaceIdOverlay extends View {
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-                                    }
+                    }
