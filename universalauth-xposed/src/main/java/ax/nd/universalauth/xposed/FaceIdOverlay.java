@@ -2,6 +2,7 @@ package ax.nd.universalauth.xposed;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
+import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Canvas;
@@ -11,228 +12,468 @@ import android.graphics.Path;
 import android.graphics.PathMeasure;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
+import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.util.DisplayMetrics;
+import android.view.Display;
 import android.view.Gravity;
+import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
 import android.view.animation.OvershootInterpolator;
+
 import java.lang.reflect.Field;
 
 public class FaceIdOverlay extends View {
 
+    private static final int STATE_SCANNING = 0;
+    private static final int STATE_SUCCESS = 1;
+    private static final int STATE_FAILURE = 2;
+
+    private static final long WAKE_APPEAR_DELAY_MS = 135L;
+    private static final long SCAN_TIMEOUT_MS = 4500L;
+
     private static FaceIdOverlay instance;
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    private static final Runnable timeoutRunnable = () -> {
+        if (instance != null && instance.state == STATE_SCANNING) {
+            instance.triggerFailureAnimation();
+        }
+    };
+
+    private static Runnable pendingShowRunnable;
+
     private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint scanLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint glyphPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF pillRect = new RectF();
+    private final RectF eyeRect = new RectF();
+    private final RectF mouthRect = new RectF();
+    private final Path nosePath = new Path();
     private final Path checkPath = new Path();
     private final Path partialCheckPath = new Path();
     private final PathMeasure pathMeasure = new PathMeasure();
 
-    private boolean isSuccess = false;
-    private float pulsePhase = 0f;
-    private float checkProgress = 0f;
-    private float morphProgress = 0f;
+    private WindowManager.LayoutParams layoutParams;
+    private int edgeGravity = Gravity.TOP;
+    private int state = STATE_SCANNING;
 
-    private ValueAnimator pulseAnimator;
-    private ValueAnimator successAnimator;
+    private float scanAngle = 0f;
+    private float morphProgress = 0f;
+    private float checkProgress = 0f;
+
+    private ValueAnimator scanAnimator;
+    private ValueAnimator stateAnimator;
+    private DisplayManager.DisplayListener displayListener;
 
     public FaceIdOverlay(Context context) {
         super(context);
-        bgPaint.setColor(Color.parseColor("#F2121216"));
+        bgPaint.setColor(Color.parseColor("#F50C0C0F"));
         bgPaint.setStyle(Paint.Style.FILL);
 
-        strokePaint.setColor(Color.WHITE);
-        strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setStrokeCap(Paint.Cap.ROUND);
-        strokePaint.setStrokeJoin(Paint.Join.ROUND);
+        borderPaint.setColor(Color.parseColor("#2EFFFFFF"));
+        borderPaint.setStyle(Paint.Style.STROKE);
+        borderPaint.setStrokeWidth(dp(context, 1.1f));
 
-        scanLinePaint.setColor(Color.parseColor("#8038BDF8"));
-        scanLinePaint.setStyle(Paint.Style.STROKE);
-        scanLinePaint.setStrokeCap(Paint.Cap.ROUND);
+        glyphPaint.setColor(Color.parseColor("#F2F2F7"));
+        glyphPaint.setStyle(Paint.Style.STROKE);
+        glyphPaint.setStrokeCap(Paint.Cap.ROUND);
+        glyphPaint.setStrokeJoin(Paint.Join.ROUND);
     }
 
     public static void showScanning(Context context) {
         if (context == null) return;
         mainHandler.post(() -> {
-            try {
-                if (instance != null && instance.isAttachedToWindow()) {
-                    if (!instance.isSuccess) return;
-                    removeInternal();
-                }
-                Context appCtx = context.getApplicationContext();
-                WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
-                if (wm == null) return;
+            if (pendingShowRunnable != null) {
+                mainHandler.removeCallbacks(pendingShowRunnable);
+            }
+            pendingShowRunnable = () -> showScanningInternal(context);
+            mainHandler.postDelayed(pendingShowRunnable, WAKE_APPEAR_DELAY_MS);
+        });
+    }
 
-                FaceIdOverlay view = new FaceIdOverlay(appCtx);
-                int sizePx = dp(appCtx, 74);
+    private static void showScanningInternal(Context context) {
+        try {
+            if (instance != null && instance.isAttachedToWindow()) {
+                if (instance.state == STATE_SCANNING) return;
+                removeInternal(true);
+            }
 
-                int[] windowTypes = new int[]{
-                        2024, // TYPE_NAVIGATION_BAR_PANEL (يظهر فوق شاشة القفل)
-                        2015, // TYPE_SECURE_SYSTEM_OVERLAY
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                };
+            Context appCtx = context.getApplicationContext();
+            WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
+            if (wm == null) return;
 
-                boolean added = false;
-                for (int type : windowTypes) {
+            FaceIdOverlay view = new FaceIdOverlay(appCtx);
+            int sizePx = dp(appCtx, 68);
+
+            int[] windowTypes = new int[]{
+                    2024, // TYPE_NAVIGATION_BAR_PANEL (فوق شاشة القفل)
+                    2015, // TYPE_SECURE_SYSTEM_OVERLAY
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            };
+
+            boolean added = false;
+            for (int type : windowTypes) {
+                try {
+                    WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                            sizePx,
+                            sizePx,
+                            type,
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                            PixelFormat.TRANSLUCENT
+                    );
                     try {
-                        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                                sizePx,
-                                sizePx,
-                                type,
-                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
-                                PixelFormat.TRANSLUCENT
-                        );
-                        params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-                        params.y = dp(appCtx, 28);
-                        try {
-                            Field privateFlags = WindowManager.LayoutParams.class.getField("privateFlags");
-                            privateFlags.setInt(params, privateFlags.getInt(params) | 0x00000010);
-                        } catch (Throwable ignored) {
-                        }
-
-                        view.setScaleX(0.5f);
-                        view.setScaleY(0.5f);
-                        view.setAlpha(0f);
-
-                        wm.addView(view, params);
-                        instance = view;
-                        added = true;
-                        break;
+                        Field privateFlags = WindowManager.LayoutParams.class.getField("privateFlags");
+                        privateFlags.setInt(params, privateFlags.getInt(params) | 0x00000010);
                     } catch (Throwable ignored) {
                     }
+
+                    view.layoutParams = params;
+                    view.updateCameraPosition(appCtx, false);
+
+                    wm.addView(view, params);
+                    instance = view;
+                    added = true;
+                    break;
+                } catch (Throwable ignored) {
                 }
-
-                if (!added) return;
-
-                view.animate()
-                        .scaleX(1f)
-                        .scaleY(1f)
-                        .alpha(1f)
-                        .setDuration(260)
-                        .setInterpolator(new OvershootInterpolator(1.25f))
-                        .start();
-
-                view.startPulse();
-            } catch (Throwable ignored) {
             }
-        });
+
+            if (!added) return;
+
+            view.registerRotationTracker(appCtx);
+            view.playEmergenceAnimation();
+            view.startScanningLoop();
+
+            mainHandler.removeCallbacks(timeoutRunnable);
+            mainHandler.postDelayed(timeoutRunnable, SCAN_TIMEOUT_MS);
+        } catch (Throwable ignored) {
+        }
     }
 
     public static void showSuccess(Context context) {
         if (context == null) return;
         mainHandler.post(() -> {
-            try {
-                if (instance == null || !instance.isAttachedToWindow()) {
-                    showScanning(context);
-                }
-                mainHandler.postDelayed(() -> {
-                    if (instance != null) {
-                        instance.triggerSuccessAnimation();
-                    }
-                }, 40);
-            } catch (Throwable ignored) {
+            if (pendingShowRunnable != null) {
+                mainHandler.removeCallbacks(pendingShowRunnable);
+                pendingShowRunnable = null;
+            }
+            mainHandler.removeCallbacks(timeoutRunnable);
+
+            if (instance == null || !instance.isAttachedToWindow()) {
+                showScanningInternal(context);
+            }
+            if (instance != null) {
+                instance.triggerSuccessAnimation();
+            }
+        });
+    }
+
+    public static void showFailure(Context context) {
+        if (context == null) return;
+        mainHandler.post(() -> {
+            if (pendingShowRunnable != null) {
+                mainHandler.removeCallbacks(pendingShowRunnable);
+                pendingShowRunnable = null;
+            }
+            mainHandler.removeCallbacks(timeoutRunnable);
+
+            if (instance != null && instance.isAttachedToWindow()) {
+                instance.triggerFailureAnimation();
             }
         });
     }
 
     public static void hide() {
         mainHandler.post(() -> {
-            if (instance != null && instance.isSuccess) {
+            if (pendingShowRunnable != null) {
+                mainHandler.removeCallbacks(pendingShowRunnable);
+                pendingShowRunnable = null;
+            }
+            mainHandler.removeCallbacks(timeoutRunnable);
+
+            if (instance != null && (instance.state == STATE_SUCCESS || instance.state == STATE_FAILURE)) {
                 return;
             }
-            removeInternal();
+            removeInternal(false);
         });
     }
 
-    private static void removeInternal() {
-        if (instance != null) {
-            FaceIdOverlay view = instance;
-            instance = null;
-            if (view.pulseAnimator != null) view.pulseAnimator.cancel();
-            if (view.successAnimator != null) view.successAnimator.cancel();
-            view.animate()
-                    .scaleX(0.6f)
-                    .scaleY(0.6f)
-                    .alpha(0f)
-                    .setDuration(220)
-                    .setListener(new AnimatorListenerAdapter() {
-                        @Override
-                        public void onAnimationEnd(Animator animation) {
-                            try {
-                                WindowManager wm = (WindowManager) view.getContext()
-                                        .getSystemService(Context.WINDOW_SERVICE);
-                                if (wm != null && view.isAttachedToWindow()) {
-                                    wm.removeView(view);
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                    })
-                    .start();
-        }
-    }
+    private void updateCameraPosition(Context ctx, boolean applyToWm) {
+        if (layoutParams == null) return;
 
-    private void startPulse() {
-        pulseAnimator = ValueAnimator.ofFloat(0f, 1f);
-        pulseAnimator.setDuration(1050);
-        pulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
-        pulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
-        pulseAnimator.setInterpolator(new DecelerateInterpolator());
-        pulseAnimator.addUpdateListener(anim -> {
-            pulsePhase = (float) anim.getAnimatedValue();
-            invalidate();
-        });
-        pulseAnimator.start();
-    }
-
-    private void triggerSuccessAnimation() {
-        if (isSuccess) return;
-        isSuccess = true;
-        if (pulseAnimator != null) pulseAnimator.cancel();
-
+        int rotation = Surface.ROTATION_90;
+        boolean naturalPortrait = true;
         try {
-            Vibrator vibrator = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
-            if (vibrator != null && vibrator.hasVibrator()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK));
-                } else {
-                    vibrator.vibrate(25);
-                }
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            Display display = (dm != null) ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
+            if (display != null) {
+                rotation = display.getRotation();
+            }
+            DisplayMetrics metrics = ctx.getResources().getDisplayMetrics();
+            boolean isCurrentlyPortrait = metrics.heightPixels >= metrics.widthPixels;
+            if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) {
+                naturalPortrait = isCurrentlyPortrait;
+            } else {
+                naturalPortrait = !isCurrentlyPortrait;
             }
         } catch (Throwable ignored) {
         }
 
-        animate()
-                .scaleX(1.1f)
-                .scaleY(1.1f)
-                .setDuration(160)
-                .withEndAction(() -> animate().scaleX(1f).scaleY(1f).setDuration(160).start())
-                .start();
+        // محاذاة موقع الكاميرا الأمامية لتابلت Samsung SM-T505N في جميع الاتجاهات
+        int effectiveRotation = naturalPortrait ? rotation : ((rotation + 1) % 4);
+        int marginFromBezel = dp(ctx, 18);
 
-        successAnimator = ValueAnimator.ofFloat(0f, 1f);
-        successAnimator.setDuration(380);
-        successAnimator.setInterpolator(new DecelerateInterpolator());
-        successAnimator.addUpdateListener(anim -> {
-            float v = (float) anim.getAnimatedValue();
-            morphProgress = Math.min(1f, v * 1.4f);
-            checkProgress = Math.max(0f, (v - 0.25f) / 0.75f);
+        switch (effectiveRotation) {
+            case Surface.ROTATION_0:
+                // الوضع الطولي: الكاميرا في منتصف الحافة اليمنى
+                edgeGravity = Gravity.RIGHT;
+                layoutParams.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL;
+                layoutParams.x = marginFromBezel;
+                layoutParams.y = 0;
+                break;
+
+            case Surface.ROTATION_180:
+                // الوضع الطولي المقلوب: الكاميرا في منتصف الحافة اليسرى
+                edgeGravity = Gravity.LEFT;
+                layoutParams.gravity = Gravity.LEFT | Gravity.CENTER_VERTICAL;
+                layoutParams.x = marginFromBezel;
+                layoutParams.y = 0;
+                break;
+
+            case Surface.ROTATION_270:
+                // الوضع الأفقي المعكوس: الكاميرا في منتصف الحافة السفلية
+                edgeGravity = Gravity.BOTTOM;
+                layoutParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                layoutParams.x = 0;
+                layoutParams.y = marginFromBezel;
+                break;
+
+            case Surface.ROTATION_90:
+            default:
+                // الوضع الأفقي القياسي: الكاميرا في منتصف الحافة العلوية
+                edgeGravity = Gravity.TOP;
+                layoutParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                layoutParams.x = 0;
+                layoutParams.y = marginFromBezel;
+                break;
+        }
+
+        if (applyToWm && isAttachedToWindow()) {
+            try {
+                WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+                if (wm != null) {
+                    wm.updateViewLayout(this, layoutParams);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void registerRotationTracker(Context ctx) {
+        try {
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) return;
+            displayListener = new DisplayManager.DisplayListener() {
+                @Override
+                public void onDisplayAdded(int displayId) {
+                }
+
+                @Override
+                public void onDisplayRemoved(int displayId) {
+                }
+
+                @Override
+                public void onDisplayChanged(int displayId) {
+                    if (displayId == Display.DEFAULT_DISPLAY && isAttachedToWindow()) {
+                        updateCameraPosition(ctx, true);
+                    }
+                }
+            };
+            dm.registerDisplayListener(displayListener, mainHandler);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void unregisterRotationTracker() {
+        if (displayListener != null) {
+            try {
+                DisplayManager dm = (DisplayManager) getContext().getSystemService(Context.DISPLAY_SERVICE);
+                if (dm != null) {
+                    dm.unregisterDisplayListener(displayListener);
+                }
+            } catch (Throwable ignored) {
+            }
+            displayListener = null;
+        }
+    }
+
+    private void playEmergenceAnimation() {
+        float offset = dp(getContext(), 28);
+        float startTx = 0f;
+        float startTy = 0f;
+
+        if (edgeGravity == Gravity.TOP) startTy = -offset;
+        else if (edgeGravity == Gravity.BOTTOM) startTy = offset;
+        else if (edgeGravity == Gravity.LEFT) startTx = -offset;
+        else if (edgeGravity == Gravity.RIGHT) startTx = offset;
+
+        setScaleX(0.22f);
+        setScaleY(0.22f);
+        setAlpha(0f);
+        setTranslationX(startTx);
+        setTranslationY(startTy);
+
+        animate()
+                .scaleX(1f)
+                .scaleY(1f)
+                .alpha(1f)
+                .translationX(0f)
+                .translationY(0f)
+                .setDuration(340)
+                .setInterpolator(new OvershootInterpolator(1.35f))
+                .start();
+    }
+
+    private void startScanningLoop() {
+        scanAnimator = ValueAnimator.ofFloat(0f, (float) (Math.PI * 2.0));
+        scanAnimator.setDuration(1900);
+        scanAnimator.setRepeatCount(ValueAnimator.INFINITE);
+        scanAnimator.setInterpolator(new LinearInterpolator());
+        scanAnimator.addUpdateListener(anim -> {
+            scanAngle = (float) anim.getAnimatedValue();
             invalidate();
         });
-        successAnimator.start();
+        scanAnimator.start();
+    }
 
-        mainHandler.postDelayed(FaceIdOverlay::removeInternal, 1300);
+    private void triggerSuccessAnimation() {
+        if (state == STATE_SUCCESS) return;
+        state = STATE_SUCCESS;
+        if (scanAnimator != null) scanAnimator.cancel();
+        if (stateAnimator != null) stateAnimator.cancel();
+
+        vibrateHaptic(false);
+
+        animate()
+                .scaleX(1.12f)
+                .scaleY(1.12f)
+                .setDuration(170)
+                .setInterpolator(new DecelerateInterpolator())
+                .withEndAction(() -> animate().scaleX(1f).scaleY(1f).setDuration(180).start())
+                .start();
+
+        stateAnimator = ValueAnimator.ofFloat(0f, 1f);
+        stateAnimator.setDuration(380);
+        stateAnimator.setInterpolator(new DecelerateInterpolator());
+        stateAnimator.addUpdateListener(anim -> {
+            float v = (float) anim.getAnimatedValue();
+            morphProgress = Math.min(1f, v * 1.5f);
+            checkProgress = Math.max(0f, (v - 0.22f) / 0.78f);
+            invalidate();
+        });
+        stateAnimator.start();
+
+        mainHandler.postDelayed(() -> removeInternal(false), 1050);
+    }
+
+    private void triggerFailureAnimation() {
+        if (state != STATE_SCANNING) return;
+        state = STATE_FAILURE;
+        if (scanAnimator != null) scanAnimator.cancel();
+        if (stateAnimator != null) stateAnimator.cancel();
+
+        vibrateHaptic(true);
+        invalidate();
+
+        // اهتزاز أفقي مطابق لفشل Face ID في آيفون
+        float d = dp(getContext(), 10);
+        ObjectAnimator shake = ObjectAnimator.ofFloat(
+                this,
+                "translationX",
+                0f, -d, d, -d * 0.75f, d * 0.75f, -d * 0.35f, d * 0.35f, 0f
+        );
+        shake.setDuration(420);
+        shake.setInterpolator(new DecelerateInterpolator());
+        shake.start();
+
+        mainHandler.postDelayed(() -> removeInternal(false), 780);
+    }
+
+    private void vibrateHaptic(boolean isError) {
+        try {
+            Vibrator vibrator = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator == null || !vibrator.hasVibrator()) return;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                int effect = isError ? VibrationEffect.EFFECT_DOUBLE_CLICK : VibrationEffect.EFFECT_CLICK;
+                vibrator.vibrate(VibrationEffect.createPredefined(effect));
+            } else {
+                vibrator.vibrate(isError ? 45 : 22);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void removeInternal(boolean immediate) {
+        if (instance == null) return;
+        FaceIdOverlay view = instance;
+        instance = null;
+        view.unregisterRotationTracker();
+        if (view.scanAnimator != null) view.scanAnimator.cancel();
+        if (view.stateAnimator != null) view.stateAnimator.cancel();
+
+        if (immediate) {
+            try {
+                WindowManager wm = (WindowManager) view.getContext().getSystemService(Context.WINDOW_SERVICE);
+                if (wm != null && view.isAttachedToWindow()) {
+                    wm.removeView(view);
+                }
+            } catch (Throwable ignored) {
+            }
+            return;
+        }
+
+        float offset = dp(view.getContext(), 26);
+        float endTx = 0f;
+        float endTy = 0f;
+        if (view.edgeGravity == Gravity.TOP) endTy = -offset;
+        else if (view.edgeGravity == Gravity.BOTTOM) endTy = offset;
+        else if (view.edgeGravity == Gravity.LEFT) endTx = -offset;
+        else if (view.edgeGravity == Gravity.RIGHT) endTx = offset;
+
+        view.animate()
+                .scaleX(0.22f)
+                .scaleY(0.22f)
+                .alpha(0f)
+                .translationX(endTx)
+                .translationY(endTy)
+                .setDuration(240)
+                .setInterpolator(new DecelerateInterpolator())
+                .setListener(new AnimatorListenerAdapter() {
+                    @Override
+                    public void onAnimationEnd(Animator animation) {
+                        try {
+                            WindowManager wm = (WindowManager) view.getContext()
+                                    .getSystemService(Context.WINDOW_SERVICE);
+                            if (wm != null && view.isAttachedToWindow()) {
+                                wm.removeView(view);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                })
+                .start();
     }
 
     @Override
@@ -240,57 +481,136 @@ public class FaceIdOverlay extends View {
         super.onDraw(canvas);
         float w = getWidth();
         float h = getHeight();
-        float pad = dp(getContext(), 4);
+        float pad = dp(getContext(), 3.5f);
         pillRect.set(pad, pad, w - pad, h - pad);
 
-        float radius = dp(getContext(), 22) + (morphProgress * (w / 2f));
-        canvas.drawRoundRect(pillRect, radius, radius, bgPaint);
+        float cornerRadius = dp(getContext(), 20) + (morphProgress * (w / 2f));
+        canvas.drawRoundRect(pillRect, cornerRadius, cornerRadius, bgPaint);
+        canvas.drawRoundRect(pillRect, cornerRadius, cornerRadius, borderPaint);
 
         float cx = w / 2f;
         float cy = h / 2f;
 
-        if (!isSuccess) {
-            float boxSize = dp(getContext(), 28) + (pulsePhase * dp(getContext(), 2.5f));
-            float half = boxSize / 2f;
-            float corner = dp(getContext(), 6.5f);
-            strokePaint.setColor(Color.WHITE);
-            strokePaint.setAlpha((int) (200 + (55 * pulsePhase)));
-            strokePaint.setStrokeWidth(dp(getContext(), 2.5f));
-
-            canvas.drawLine(cx - half, cy - half + corner, cx - half, cy - half, strokePaint);
-            canvas.drawLine(cx - half, cy - half, cx - half + corner, cy - half, strokePaint);
-
-            canvas.drawLine(cx + half - corner, cy - half, cx + half, cy - half, strokePaint);
-            canvas.drawLine(cx + half, cy - half, cx + half, cy - half + corner, strokePaint);
-
-            canvas.drawLine(cx - half, cy + half - corner, cx - half, cy + half, strokePaint);
-            canvas.drawLine(cx - half, cy + half, cx - half + corner, cy + half, strokePaint);
-
-            canvas.drawLine(cx + half - corner, cy + half, cx + half, cy + half, strokePaint);
-            canvas.drawLine(cx + half, cy + half, cx + half, cy + half - corner, strokePaint);
-
-            float scanY = (cy - half + dp(getContext(), 3)) + (pulsePhase * (boxSize - dp(getContext(), 6)));
-            scanLinePaint.setStrokeWidth(dp(getContext(), 2.2f));
-            canvas.drawLine(cx - half + dp(getContext(), 3), scanY, cx + half - dp(getContext(), 3), scanY, scanLinePaint);
-        } else {
-            strokePaint.setColor(Color.parseColor("#34C759"));
-            strokePaint.setAlpha(255);
-            strokePaint.setStrokeWidth(dp(getContext(), 3f));
-            canvas.drawCircle(cx, cy, dp(getContext(), 18.5f), strokePaint);
+        if (state == STATE_SUCCESS) {
+            // حلقة النجاح الخضراء وعلامة الصح المتحركة
+            glyphPaint.setColor(Color.parseColor("#34C759"));
+            glyphPaint.setAlpha(255);
+            glyphPaint.setStrokeWidth(dp(getContext(), 2.8f));
+            canvas.drawCircle(cx, cy, dp(getContext(), 17.5f), glyphPaint);
 
             checkPath.reset();
-            checkPath.moveTo(cx - dp(getContext(), 8f), cy + dp(getContext(), 0.5f));
-            checkPath.lineTo(cx - dp(getContext(), 2f), cy + dp(getContext(), 6.5f));
-            checkPath.lineTo(cx + dp(getContext(), 9f), cy - dp(getContext(), 6f));
+            checkPath.moveTo(cx - dp(getContext(), 7.5f), cy + dp(getContext(), 0.5f));
+            checkPath.lineTo(cx - dp(getContext(), 1.8f), cy + dp(getContext(), 6.2f));
+            checkPath.lineTo(cx + dp(getContext(), 8.5f), cy - dp(getContext(), 5.5f));
 
             pathMeasure.setPath(checkPath, false);
             partialCheckPath.reset();
             pathMeasure.getSegment(0f, pathMeasure.getLength() * checkProgress, partialCheckPath, true);
-            canvas.drawPath(partialCheckPath, strokePaint);
+            canvas.drawPath(partialCheckPath, glyphPaint);
+            return;
         }
+
+        boolean isFail = (state == STATE_FAILURE);
+        float breath = isFail ? 0f : (float) Math.sin(scanAngle);
+        float lookX = isFail ? 0f : (float) Math.sin(scanAngle) * dp(getContext(), 1.6f);
+        float lookY = isFail ? 0f : (float) Math.cos(scanAngle * 2.0) * dp(getContext(), 0.9f);
+
+        float boxHalf = dp(getContext(), 14.5f) + (breath * dp(getContext(), 0.8f));
+        float bracketLen = dp(getContext(), 6.2f);
+        float arcR = dp(getContext(), 3.5f);
+
+        glyphPaint.setColor(isFail ? Color.parseColor("#FF3B30") : Color.parseColor("#F2F2F7"));
+        glyphPaint.setAlpha(255);
+        glyphPaint.setStrokeWidth(dp(getContext(), 2.3f));
+
+        // رسم الزوايا الأربع لإطار Face ID
+        drawCornerBrackets(canvas, cx, cy, boxHalf, bracketLen, arcR);
+
+        // رسم ملامح وجه Face ID بحركة نظرة ناعمة
+        float fcx = cx + lookX;
+        float fcy = cy + lookY;
+        float eyeOffsetX = dp(getContext(), 5.2f);
+        float eyeOffsetY = dp(getContext(), 3.2f);
+
+        // حركة رمش طبيعية خفيفة أثناء المسح
+        float blinkFactor = (!isFail && Math.sin(scanAngle) > 0.94f) ? 0.25f : 1f;
+        float eyeHalfH = dp(getContext(), 2.1f) * blinkFactor;
+
+        glyphPaint.setStrokeWidth(dp(getContext(), 2.2f));
+        canvas.drawLine(fcx - eyeOffsetX, fcy - eyeOffsetY - eyeHalfH,
+                fcx - eyeOffsetX, fcy - eyeOffsetY + eyeHalfH, glyphPaint);
+        canvas.drawLine(fcx + eyeOffsetX, fcy - eyeOffsetY - eyeHalfH,
+                fcx + eyeOffsetX, fcy - eyeOffsetY + eyeHalfH, glyphPaint);
+
+        // الأنف
+        nosePath.reset();
+        nosePath.moveTo(fcx + dp(getContext(), 0.3f), fcy - dp(getContext(), 2.2f));
+        nosePath.lineTo(fcx + dp(getContext(), 0.3f), fcy + dp(getContext(), 1.6f));
+        nosePath.lineTo(fcx - dp(getContext(), 1.3f), fcy + dp(getContext(), 1.6f));
+        glyphPaint.setStrokeWidth(dp(getContext(), 1.9f));
+        canvas.drawPath(nosePath, glyphPaint);
+
+        // الفم (ابتسامة عند المسح، أو خط/انحناء حزين عند الفشل)
+        glyphPaint.setStrokeWidth(dp(getContext(), 2.1f));
+        if (!isFail) {
+            mouthRect.set(
+                    fcx - dp(getContext(), 5.2f),
+                    fcy + dp(getContext(), 1.2f),
+                    fcx + dp(getContext(), 5.2f),
+                    fcy + dp(getContext(), 7.2f)
+            );
+            canvas.drawArc(mouthRect, 25f, 130f, false, glyphPaint);
+        } else {
+            mouthRect.set(
+                    fcx - dp(getContext(), 4.8f),
+                    fcy + dp(getContext(), 4.5f),
+                    fcx + dp(getContext(), 4.8f),
+                    fcy + dp(getContext(), 9.5f)
+            );
+            canvas.drawArc(mouthRect, 205f, 130f, false, glyphPaint);
+        }
+    }
+
+    private void drawCornerBrackets(Canvas canvas, float cx, float cy, float half, float len, float r) {
+        float l = cx - half;
+        float t = cy - half;
+        float ri = cx + half;
+        float b = cy + half;
+
+        // أعلى اليسار
+        Path p = new Path();
+        p.moveTo(l, t + len);
+        p.lineTo(l, t + r);
+        p.quadTo(l, t, l + r, t);
+        p.lineTo(l + len, t);
+        canvas.drawPath(p, glyphPaint);
+
+        // أعلى اليمين
+        p.reset();
+        p.moveTo(ri - len, t);
+        p.lineTo(ri - r, t);
+        p.quadTo(ri, t, ri, t + r);
+        p.lineTo(ri, t + len);
+        canvas.drawPath(p, glyphPaint);
+
+        // أسفل اليسار
+        p.reset();
+        p.moveTo(l, b - len);
+        p.lineTo(l, b - r);
+        p.quadTo(l, b, l + r, b);
+        p.lineTo(l + len, b);
+        canvas.drawPath(p, glyphPaint);
+
+        // أسفل اليمين
+        p.reset();
+        p.moveTo(ri - len, b);
+        p.lineTo(ri - r, b);
+        p.quadTo(ri, b, ri, b - r);
+        p.lineTo(ri, b - len);
+        canvas.drawPath(p, glyphPaint);
     }
 
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-                                  }
+                                    }
