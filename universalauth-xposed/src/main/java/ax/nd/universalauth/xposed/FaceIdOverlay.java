@@ -21,6 +21,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.OvershootInterpolator;
+import java.lang.reflect.Field;
 
 public class FaceIdOverlay extends View {
 
@@ -45,7 +46,7 @@ public class FaceIdOverlay extends View {
 
     public FaceIdOverlay(Context context) {
         super(context);
-        bgPaint.setColor(Color.parseColor("#EB121215"));
+        bgPaint.setColor(Color.parseColor("#F2121216"));
         bgPaint.setStyle(Paint.Style.FILL);
 
         strokePaint.setColor(Color.WHITE);
@@ -53,7 +54,7 @@ public class FaceIdOverlay extends View {
         strokePaint.setStrokeCap(Paint.Cap.ROUND);
         strokePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        scanLinePaint.setColor(Color.parseColor("#6638BDF8"));
+        scanLinePaint.setColor(Color.parseColor("#8038BDF8"));
         scanLinePaint.setStyle(Paint.Style.STROKE);
         scanLinePaint.setStrokeCap(Paint.Cap.ROUND);
     }
@@ -71,32 +72,55 @@ public class FaceIdOverlay extends View {
                 if (wm == null) return;
 
                 FaceIdOverlay view = new FaceIdOverlay(appCtx);
-                int sizePx = dp(appCtx, 68);
+                int sizePx = dp(appCtx, 74);
 
-                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                        sizePx,
-                        sizePx,
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                        PixelFormat.TRANSLUCENT
-                );
-                params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-                params.y = dp(appCtx, 38);
+                int[] windowTypes = new int[]{
+                        2024, // TYPE_NAVIGATION_BAR_PANEL (يظهر فوق شاشة القفل)
+                        2015, // TYPE_SECURE_SYSTEM_OVERLAY
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                };
 
-                view.setScaleX(0.5f);
-                view.setScaleY(0.5f);
-                view.setAlpha(0f);
+                boolean added = false;
+                for (int type : windowTypes) {
+                    try {
+                        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                                sizePx,
+                                sizePx,
+                                type,
+                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                                PixelFormat.TRANSLUCENT
+                        );
+                        params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                        params.y = dp(appCtx, 28);
+                        try {
+                            Field privateFlags = WindowManager.LayoutParams.class.getField("privateFlags");
+                            privateFlags.setInt(params, privateFlags.getInt(params) | 0x00000010);
+                        } catch (Throwable ignored) {
+                        }
 
-                wm.addView(view, params);
-                instance = view;
+                        view.setScaleX(0.5f);
+                        view.setScaleY(0.5f);
+                        view.setAlpha(0f);
+
+                        wm.addView(view, params);
+                        instance = view;
+                        added = true;
+                        break;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                if (!added) return;
 
                 view.animate()
                         .scaleX(1f)
                         .scaleY(1f)
                         .alpha(1f)
-                        .setDuration(280)
+                        .setDuration(260)
                         .setInterpolator(new OvershootInterpolator(1.25f))
                         .start();
 
@@ -113,16 +137,23 @@ public class FaceIdOverlay extends View {
                 if (instance == null || !instance.isAttachedToWindow()) {
                     showScanning(context);
                 }
-                if (instance != null) {
-                    instance.triggerSuccessAnimation();
-                }
+                mainHandler.postDelayed(() -> {
+                    if (instance != null) {
+                        instance.triggerSuccessAnimation();
+                    }
+                }, 40);
             } catch (Throwable ignored) {
             }
         });
     }
 
     public static void hide() {
-        mainHandler.post(FaceIdOverlay::removeInternal);
+        mainHandler.post(() -> {
+            if (instance != null && instance.isSuccess) {
+                return;
+            }
+            removeInternal();
+        });
     }
 
     private static void removeInternal() {
@@ -155,7 +186,7 @@ public class FaceIdOverlay extends View {
 
     private void startPulse() {
         pulseAnimator = ValueAnimator.ofFloat(0f, 1f);
-        pulseAnimator.setDuration(1100);
+        pulseAnimator.setDuration(1050);
         pulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
         pulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
         pulseAnimator.setInterpolator(new DecelerateInterpolator());
@@ -184,14 +215,14 @@ public class FaceIdOverlay extends View {
         }
 
         animate()
-                .scaleX(1.08f)
-                .scaleY(1.08f)
+                .scaleX(1.1f)
+                .scaleY(1.1f)
                 .setDuration(160)
                 .withEndAction(() -> animate().scaleX(1f).scaleY(1f).setDuration(160).start())
                 .start();
 
         successAnimator = ValueAnimator.ofFloat(0f, 1f);
-        successAnimator.setDuration(360);
+        successAnimator.setDuration(380);
         successAnimator.setInterpolator(new DecelerateInterpolator());
         successAnimator.addUpdateListener(anim -> {
             float v = (float) anim.getAnimatedValue();
@@ -201,7 +232,7 @@ public class FaceIdOverlay extends View {
         });
         successAnimator.start();
 
-        mainHandler.postDelayed(FaceIdOverlay::removeInternal, 850);
+        mainHandler.postDelayed(FaceIdOverlay::removeInternal, 1300);
     }
 
     @Override
@@ -212,21 +243,20 @@ public class FaceIdOverlay extends View {
         float pad = dp(getContext(), 4);
         pillRect.set(pad, pad, w - pad, h - pad);
 
-        float radius = dp(getContext(), 20) + (morphProgress * (w / 2f));
+        float radius = dp(getContext(), 22) + (morphProgress * (w / 2f));
         canvas.drawRoundRect(pillRect, radius, radius, bgPaint);
 
         float cx = w / 2f;
         float cy = h / 2f;
 
         if (!isSuccess) {
-            float boxSize = dp(getContext(), 26) + (pulsePhase * dp(getContext(), 2));
+            float boxSize = dp(getContext(), 28) + (pulsePhase * dp(getContext(), 2.5f));
             float half = boxSize / 2f;
-            float corner = dp(getContext(), 6);
+            float corner = dp(getContext(), 6.5f);
             strokePaint.setColor(Color.WHITE);
-            strokePaint.setAlpha((int) (190 + (65 * pulsePhase)));
-            strokePaint.setStrokeWidth(dp(getContext(), 2.4f));
+            strokePaint.setAlpha((int) (200 + (55 * pulsePhase)));
+            strokePaint.setStrokeWidth(dp(getContext(), 2.5f));
 
-            // زوايا إطار Face ID الأربعة
             canvas.drawLine(cx - half, cy - half + corner, cx - half, cy - half, strokePaint);
             canvas.drawLine(cx - half, cy - half, cx - half + corner, cy - half, strokePaint);
 
@@ -239,21 +269,19 @@ public class FaceIdOverlay extends View {
             canvas.drawLine(cx + half - corner, cy + half, cx + half, cy + half, strokePaint);
             canvas.drawLine(cx + half, cy + half, cx + half, cy + half - corner, strokePaint);
 
-            // خط المسح الضوئي المتحرك
             float scanY = (cy - half + dp(getContext(), 3)) + (pulsePhase * (boxSize - dp(getContext(), 6)));
-            scanLinePaint.setStrokeWidth(dp(getContext(), 2f));
+            scanLinePaint.setStrokeWidth(dp(getContext(), 2.2f));
             canvas.drawLine(cx - half + dp(getContext(), 3), scanY, cx + half - dp(getContext(), 3), scanY, scanLinePaint);
         } else {
-            // حلقة النجاح الخضراء وعلامة الصح المتحركة
             strokePaint.setColor(Color.parseColor("#34C759"));
             strokePaint.setAlpha(255);
-            strokePaint.setStrokeWidth(dp(getContext(), 2.8f));
-            canvas.drawCircle(cx, cy, dp(getContext(), 17), strokePaint);
+            strokePaint.setStrokeWidth(dp(getContext(), 3f));
+            canvas.drawCircle(cx, cy, dp(getContext(), 18.5f), strokePaint);
 
             checkPath.reset();
-            checkPath.moveTo(cx - dp(getContext(), 7.5f), cy + dp(getContext(), 0.5f));
-            checkPath.lineTo(cx - dp(getContext(), 2f), cy + dp(getContext(), 6f));
-            checkPath.lineTo(cx + dp(getContext(), 8.5f), cy - dp(getContext(), 5.5f));
+            checkPath.moveTo(cx - dp(getContext(), 8f), cy + dp(getContext(), 0.5f));
+            checkPath.lineTo(cx - dp(getContext(), 2f), cy + dp(getContext(), 6.5f));
+            checkPath.lineTo(cx + dp(getContext(), 9f), cy - dp(getContext(), 6f));
 
             pathMeasure.setPath(checkPath, false);
             partialCheckPath.reset();
@@ -265,4 +293,4 @@ public class FaceIdOverlay extends View {
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-  }
+                                  }
