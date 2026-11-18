@@ -241,7 +241,7 @@ public class Module implements IXposedHookLoadPackage {
         }
     }
 
-    private int failedScanAttempts = 0;
+        private int failedScanAttempts = 0;
     private boolean scanWasActive = false;
     private boolean unlockedInCurrentCycle = false;
 
@@ -345,7 +345,6 @@ public class Module implements IXposedHookLoadPackage {
 
         UnlockMethod method = hookStatusBarBiometricUnlock(classLoader, statusBar, statusBarClass);
 
-        // استقبال نتيجة فحص الانعكاس والحيوية وتصفير المحاولات عند فتح القفل يدوياً
         android.content.BroadcastReceiver livenessReceiver = new android.content.BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent resIntent) {
@@ -366,20 +365,20 @@ public class Module implements IXposedHookLoadPackage {
                         android.widget.Toast.makeText(context, "يرجى منح إذن الكاميرا لتطبيق UniversalAuth", android.widget.Toast.LENGTH_LONG).show();
                     }
 
-                    if (passed && !isUserInLockdown(kum)) {
-                        unlockedInCurrentCycle = true;
-                        failedScanAttempts = 0;
-                        FaceIdOverlay.showSuccess(context);
-                        setLockscreenUnlocked(true);
-                        try {
+                    try {
+                        if (passed && !isUserInLockdown(kum)) {
+                            unlockedInCurrentCycle = true;
+                            failedScanAttempts = 0;
+                            FaceIdOverlay.showSuccess(context);
+                            setLockscreenUnlocked(true);
                             if (isBouncerShowing()) {
                                 method.unlock(new Intent());
                             }
-                        } catch (Throwable ignored) {
+                        } else {
+                            failedScanAttempts++;
+                            FaceIdOverlay.showFailure(context);
                         }
-                    } else {
-                        failedScanAttempts++;
-                        FaceIdOverlay.showFailure(context);
+                    } catch (Throwable ignored) {
                     }
                 }
             }
@@ -394,7 +393,6 @@ public class Module implements IXposedHookLoadPackage {
             context.registerReceiver(livenessReceiver, filter);
         }
 
-        // عند نجاح FaceGuard، يتم تحرير الكاميرا وتشغيل مرحلة التأكيد النهائي قبل الفتح
         UnlockReceiver.INSTANCE.setup(context, statusBar, intent -> {
             try {
                 if (isUserInLockdown(kum) || failedScanAttempts >= 3) {
@@ -452,4 +450,5 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
     }
-                    }
+}
+
