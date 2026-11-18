@@ -5,7 +5,6 @@ import static ax.nd.universalauth.xposed.common.XposedConstants.EXTRA_UNLOCK_MOD
 import static ax.nd.universalauth.xposed.common.XposedConstants.MODE_UNLOCK_FADING;
 
 import android.annotation.SuppressLint;
-import android.app.Application;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -233,10 +232,15 @@ public class Module implements IXposedHookLoadPackage {
         }
     }
 
+    private static final int LIGHT_LEVEL_LIT = 0;        // غرفة منيرة: لا إضاءة
+    private static final int LIGHT_LEVEL_DIM = 1;        // خافتة جداً: إضاءة فقط إذا فشلت المحاولة الأولى
+    private static final int LIGHT_LEVEL_PITCH_DARK = 2; // ظلام دامس: إضاءة فورية
+
     private int failedScanAttempts = 0;
     private boolean scanWasActive = false;
     private boolean unlockedInCurrentCycle = false;
     private int scanGeneration = 0;
+    private int currentLightLevel = LIGHT_LEVEL_LIT;
 
     private long lastSuccessfulUnlockElapsedMs = 0L;
     private boolean pinRequiredByInactivity = false;
@@ -286,20 +290,20 @@ public class Module implements IXposedHookLoadPackage {
     }
 
     private interface DarknessCallback {
-        void onResult(boolean isDark);
+        void onResult(int lightLevel);
     }
 
     @SuppressLint("MissingPermission")
     private void checkDarknessViaFrontCamera(Context context, int generation, DarknessCallback callback) {
         android.os.Handler mainH = getScanHandler();
         if (context == null || mainH == null) {
-            if (callback != null) callback.onResult(false);
+            if (callback != null) callback.onResult(LIGHT_LEVEL_LIT);
             return;
         }
 
         final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean(false);
         final java.util.concurrent.atomic.AtomicInteger frameCounter = new java.util.concurrent.atomic.AtomicInteger(0);
-        final java.util.concurrent.atomic.AtomicInteger lastIso = new java.util.concurrent.atomic.AtomicInteger(100);
+        final java.util.concurrent.atomic.AtomicBoolean aeConverged = new java.util.concurrent.atomic.AtomicBoolean(false);
         final android.os.HandlerThread camThread = new android.os.HandlerThread("UA_DarkProbe");
         camThread.start();
         final android.os.Handler camHandler = new android.os.Handler(camThread.getLooper());
@@ -328,17 +332,17 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
 
-        // مهلة أمان 850ms تسمح بتشغيل الكاميرا وقراءة التعريض الحقيقي دون فشل مبكر
+        // مهلة أمان 900ms؛ عند انتهائها نفترض أن الإضاءة طبيعية حتى لا تضيء الشاشة بالخطأ
         camHandler.postDelayed(() -> {
             if (finished.compareAndSet(false, true)) {
                 cleanupAndFinish.run();
                 mainH.post(() -> {
                     if (scanGeneration == generation && scanWasActive) {
-                        callback.onResult(false);
+                        callback.onResult(LIGHT_LEVEL_LIT);
                     }
                 });
             }
-        }, 850L);
+        }, 900L);
 
         camHandler.post(() -> {
             try {
@@ -348,7 +352,7 @@ public class Module implements IXposedHookLoadPackage {
                     if (finished.compareAndSet(false, true)) {
                         cleanupAndFinish.run();
                         mainH.post(() -> {
-                            if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                            if (scanGeneration == generation && scanWasActive) callback.onResult(LIGHT_LEVEL_LIT);
                         });
                     }
                     return;
@@ -368,7 +372,7 @@ public class Module implements IXposedHookLoadPackage {
                     if (finished.compareAndSet(false, true)) {
                         cleanupAndFinish.run();
                         mainH.post(() -> {
-                            if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                            if (scanGeneration == generation && scanWasActive) callback.onResult(LIGHT_LEVEL_LIT);
                         });
                     }
                     return;
@@ -383,11 +387,14 @@ public class Module implements IXposedHookLoadPackage {
                 reader.setOnImageAvailableListener(r -> {
                     android.media.Image img = null;
                     float meanLuma = 128f;
+                    int p90Luma = 128;
                     try {
                         img = r.acquireLatestImage();
                         if (img == null) return;
 
-                        if (frameCounter.incrementAndGet() < 2) {
+                        int fNum = frameCounter.incrementAndGet();
+                        // انتظار استقرار التعريض التلقائي (AE) للكاميرا قبل الحكم على الإضاءة
+                        if (fNum < 3 || (!aeConverged.get() && fNum < 5)) {
                             img.close();
                             return;
                         }
@@ -398,6 +405,7 @@ public class Module implements IXposedHookLoadPackage {
                         int pixelStride = yPlane.getPixelStride();
                         int iw = img.getWidth();
                         int ih = img.getHeight();
+                        int[] hist = new int[256];
                         long sum = 0;
                         int count = 0;
                         for (int row = ih / 4; row < (ih * 3) / 4; row += 2) {
@@ -405,13 +413,24 @@ public class Module implements IXposedHookLoadPackage {
                             for (int col = iw / 4; col < (iw * 3) / 4; col += 2) {
                                 int idx = rowStart + col * pixelStride;
                                 if (idx < buf.limit()) {
-                                    sum += (buf.get(idx) & 0xFF);
+                                    int y = buf.get(idx) & 0xFF;
+                                    sum += y;
+                                    hist[y]++;
                                     count++;
                                 }
                             }
                         }
                         if (count > 0) {
                             meanLuma = (float) sum / count;
+                            int target90 = (int) (count * 0.90f);
+                            int acc = 0;
+                            for (int v = 0; v < 256; v++) {
+                                acc += hist[v];
+                                if (acc >= target90) {
+                                    p90Luma = v;
+                                    break;
+                                }
+                            }
                         }
                     } catch (Throwable ignored) {
                     } finally {
@@ -423,15 +442,20 @@ public class Module implements IXposedHookLoadPackage {
                         }
                     }
 
-                    int iso = lastIso.get();
-                    // كشف الظلام الحقيقي عبر دمج سطوع الصورة مع حساسية المستشعر (ISO)
-                    final boolean isDark = (meanLuma < 52.0f) || (iso >= 750 && meanLuma < 88.0f);
+                    final int detectedLevel;
+                    if (meanLuma < 22.0f && p90Luma < 34) {
+                        detectedLevel = LIGHT_LEVEL_PITCH_DARK;
+                    } else if (meanLuma < 34.0f && p90Luma < 50) {
+                        detectedLevel = LIGHT_LEVEL_DIM;
+                    } else {
+                        detectedLevel = LIGHT_LEVEL_LIT;
+                    }
 
                     if (finished.compareAndSet(false, true)) {
                         cleanupAndFinish.run();
                         mainH.post(() -> {
                             if (scanGeneration == generation && scanWasActive) {
-                                callback.onResult(isDark);
+                                callback.onResult(detectedLevel);
                             }
                         });
                     }
@@ -467,10 +491,12 @@ public class Module implements IXposedHookLoadPackage {
                                                                     android.hardware.camera2.CaptureRequest request,
                                                                     android.hardware.camera2.TotalCaptureResult result) {
                                                                 try {
-                                                                    Integer isoVal = result.get(
-                                                                            android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY);
-                                                                    if (isoVal != null) {
-                                                                        lastIso.set(isoVal);
+                                                                    Integer aeState = result.get(
+                                                                            android.hardware.camera2.CaptureResult.CONTROL_AE_STATE);
+                                                                    if (aeState != null &&
+                                                                            (aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED
+                                                                                    || aeState == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)) {
+                                                                        aeConverged.set(true);
                                                                     }
                                                                 } catch (Throwable ignored) {
                                                                 }
@@ -504,7 +530,7 @@ public class Module implements IXposedHookLoadPackage {
                 if (finished.compareAndSet(false, true)) {
                     cleanupAndFinish.run();
                     mainH.post(() -> {
-                        if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                        if (scanGeneration == generation && scanWasActive) callback.onResult(LIGHT_LEVEL_LIT);
                     });
                 }
             }
@@ -524,6 +550,11 @@ public class Module implements IXposedHookLoadPackage {
                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
 
                 FaceIdOverlay.triggerRetryTransition();
+
+                // إذا كانت الإضاءة خافتة جداً وفشلت المحاولة الأولى، شغّل إضاءة الشاشة للمحاولة الثانية
+                if (currentLightLevel == LIGHT_LEVEL_DIM) {
+                    FaceIdOverlay.enableFillLight(context);
+                }
 
                 android.os.Handler innerH = getScanHandler();
                 if (innerH != null) {
@@ -555,17 +586,17 @@ public class Module implements IXposedHookLoadPackage {
             }
             scanWasActive = true;
             unlockedInCurrentCycle = false;
+            currentLightLevel = LIGHT_LEVEL_LIT;
             final int currentGen = ++scanGeneration;
 
-            // إظهار كبسولة Face ID فوراً بدون أي تأخير
             FaceIdOverlay.showScanning(context);
 
-            // فحص الظلام عبر الكاميرا الأمامية قبل إطلاق FaceGuard
-            checkDarknessViaFrontCamera(context, currentGen, isDark -> {
+            checkDarknessViaFrontCamera(context, currentGen, lightLevel -> {
                 if (!scanWasActive || unlockedInCurrentCycle || scanGeneration != currentGen) return;
                 if (isTimedOutRequirePin()) return;
 
-                if (isDark) {
+                currentLightLevel = lightLevel;
+                if (lightLevel == LIGHT_LEVEL_PITCH_DARK) {
                     FaceIdOverlay.enableFillLight(context);
                 }
                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
@@ -635,7 +666,6 @@ public class Module implements IXposedHookLoadPackage {
             public void onReceive(Context ctx, Intent resIntent) {
                 String action = resIntent.getAction();
                 if (Intent.ACTION_USER_PRESENT.equals(action)) {
-                    // فتح الجهاز بنجاح (سواء برمز PIN أو بسحب الشاشة بعد الوجه) يعيد ضبط مؤقت 45 دقيقة
                     recordSuccessfulUnlock();
                     unlockedInCurrentCycle = false;
                     scanWasActive = false;
@@ -741,4 +771,4 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
     }
-                                                     }
+            }
