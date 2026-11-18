@@ -247,18 +247,32 @@ public class Module implements IXposedHookLoadPackage {
 
     private static final long FIRST_SCAN_WINDOW_MS = 2600L;
     private static final long RESCAN_RESET_GAP_MS = 180L;
-    private final android.os.Handler scanHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private android.os.Handler scanHandler;
     private Runnable secondScanRunnable;
 
-    private void cancelPendingSecondScan() {
-        if (secondScanRunnable != null) {
-            scanHandler.removeCallbacks(secondScanRunnable);
-            secondScanRunnable = null;
+    private android.os.Handler getScanHandler() {
+        if (scanHandler == null) {
+            android.os.Looper looper = android.os.Looper.getMainLooper();
+            if (looper != null) {
+                scanHandler = new android.os.Handler(looper);
+            }
         }
+        return scanHandler;
+    }
+
+    private void cancelPendingSecondScan() {
+        android.os.Handler h = getScanHandler();
+        if (h != null && secondScanRunnable != null) {
+            h.removeCallbacks(secondScanRunnable);
+        }
+        secondScanRunnable = null;
     }
 
     private void scheduleSecondRealScan(Context context) {
         cancelPendingSecondScan();
+        android.os.Handler h = getScanHandler();
+        if (h == null) return;
+
         secondScanRunnable = () -> {
             if (!scanWasActive || unlockedInCurrentCycle || context == null) return;
             try {
@@ -266,20 +280,23 @@ public class Module implements IXposedHookLoadPackage {
                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
                 FaceIdOverlay.triggerRetryPulse();
 
-                scanHandler.postDelayed(() -> {
-                    if (scanWasActive && !unlockedInCurrentCycle) {
-                        try {
-                            context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
-                                    .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
-                        } catch (Throwable ignored) {
+                android.os.Handler innerH = getScanHandler();
+                if (innerH != null) {
+                    innerH.postDelayed(() -> {
+                        if (scanWasActive && !unlockedInCurrentCycle) {
+                            try {
+                                context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                                        .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
+                            } catch (Throwable ignored) {
+                            }
                         }
-                    }
-                }, RESCAN_RESET_GAP_MS);
+                    }, RESCAN_RESET_GAP_MS);
+                }
             } catch (Throwable ignored) {
             }
         };
-        scanHandler.postDelayed(secondScanRunnable, FIRST_SCAN_WINDOW_MS);
-    }
+        h.postDelayed(secondScanRunnable, FIRST_SCAN_WINDOW_MS);
+            }
 
     private void hookEarlyUnlock(Context context, boolean newAwakeKeyguard) throws Throwable {
         if (newAwakeKeyguard) {
