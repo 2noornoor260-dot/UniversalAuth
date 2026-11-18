@@ -44,17 +44,8 @@ public class Module implements IXposedHookLoadPackage {
 
     private Method isUserInLockdownMethod;
 
-    /**
-     * This method is called when an app is loaded. It's called very early, even before
-     * {@link Application#onCreate} is called.
-     * Modules can set up their app-specific hooks here.
-     *
-     * @param lpparam Information about the app.
-     * @throws Throwable Everything the callback throws is caught and logged.
-     */
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        // Hook SystemUi
         if (Objects.equals(lpparam.packageName, "com.android.systemui")) {
             Class<?> kumClazz = lpparam.classLoader.loadClass(KEYGUARD_UPDATE_MONITOR_CLASS);
             isUserInLockdownMethod = getIsUserInLockdownMethod(kumClazz);
@@ -75,7 +66,6 @@ public class Module implements IXposedHookLoadPackage {
                 XposedBridge.log(th);
             }
 
-            // Hook com.android.keyguard.KeyguardUpdateMonitor.updateFaceListeningState
             try {
                 addHookEarlyUnlock(kumClazz, lpparam);
             } catch (Throwable th) {
@@ -112,7 +102,7 @@ public class Module implements IXposedHookLoadPackage {
         return isUserInLockdownMethod != null && (boolean) isUserInLockdownMethod.invoke(kum, Util.INSTANCE.getCurrentUser());
     }
 
-            private Object cachedKum;
+    private Object cachedKum;
     private Object cachedStatusBar;
     private Class<?> cachedStatusBarClass;
 
@@ -241,12 +231,15 @@ public class Module implements IXposedHookLoadPackage {
         }
     }
 
-        private int failedScanAttempts = 0;
+    private int failedScanAttempts = 0;
     private boolean scanWasActive = false;
     private boolean unlockedInCurrentCycle = false;
+    private int scanGeneration = 0;
 
-    private static final long FIRST_SCAN_WINDOW_MS = 2600L;
-    private static final long RESCAN_RESET_GAP_MS = 180L;
+    private static final long FIRST_SCAN_WINDOW_MS = 2200L;
+    private static final long RESCAN_RESET_GAP_MS = 600L;
+    private static final float CAMERA_DARK_LUMA_THRESHOLD = 46.0f;
+
     private android.os.Handler scanHandler;
     private Runnable secondScanRunnable;
 
@@ -268,22 +261,233 @@ public class Module implements IXposedHookLoadPackage {
         secondScanRunnable = null;
     }
 
-    private void scheduleSecondRealScan(Context context) {
+    private interface DarknessCallback {
+        void onResult(boolean isDark);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void checkDarknessViaFrontCamera(Context context, int generation, DarknessCallback callback) {
+        android.os.Handler mainH = getScanHandler();
+        if (context == null || mainH == null) {
+            if (callback != null) callback.onResult(false);
+            return;
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.atomic.AtomicInteger frameCounter = new java.util.concurrent.atomic.AtomicInteger(0);
+        final android.os.HandlerThread camThread = new android.os.HandlerThread("UA_DarkProbe");
+        camThread.start();
+        final android.os.Handler camHandler = new android.os.Handler(camThread.getLooper());
+
+        final android.hardware.camera2.CameraDevice[] devRef = new android.hardware.camera2.CameraDevice[1];
+        final android.media.ImageReader[] readerRef = new android.media.ImageReader[1];
+
+        final Runnable cleanupAndFinish = () -> {
+            try {
+                if (devRef[0] != null) {
+                    devRef[0].close();
+                    devRef[0] = null;
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (readerRef[0] != null) {
+                    readerRef[0].close();
+                    readerRef[0] = null;
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                camThread.quitSafely();
+            } catch (Throwable ignored) {
+            }
+        };
+
+        // مهلة أمان 350ms لضمان عدم تأخر بدء المسح إطلاقاً
+        camHandler.postDelayed(() -> {
+            if (finished.compareAndSet(false, true)) {
+                cleanupAndFinish.run();
+                mainH.post(() -> {
+                    if (scanGeneration == generation && scanWasActive) {
+                        callback.onResult(false);
+                    }
+                });
+            }
+        }, 350L);
+
+        camHandler.post(() -> {
+            try {
+                android.hardware.camera2.CameraManager cm = (android.hardware.camera2.CameraManager)
+                        context.getSystemService(Context.CAMERA_SERVICE);
+                if (cm == null) {
+                    if (finished.compareAndSet(false, true)) {
+                        cleanupAndFinish.run();
+                        mainH.post(() -> {
+                            if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                        });
+                    }
+                    return;
+                }
+
+                String frontId = null;
+                for (String id : cm.getCameraIdList()) {
+                    android.hardware.camera2.CameraCharacteristics chars = cm.getCameraCharacteristics(id);
+                    Integer facing = chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
+                    if (facing != null && facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT) {
+                        frontId = id;
+                        break;
+                    }
+                }
+
+                if (frontId == null) {
+                    if (finished.compareAndSet(false, true)) {
+                        cleanupAndFinish.run();
+                        mainH.post(() -> {
+                            if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                        });
+                    }
+                    return;
+                }
+
+                final int w = 160;
+                final int h = 120;
+                android.media.ImageReader reader = android.media.ImageReader.newInstance(
+                        w, h, android.graphics.ImageFormat.YUV_420_888, 2);
+                readerRef[0] = reader;
+
+                reader.setOnImageAvailableListener(r -> {
+                    android.media.Image img = null;
+                    float meanLuma = 128f;
+                    try {
+                        img = r.acquireLatestImage();
+                        if (img == null) return;
+
+                        // تخطي الإطار الأول حتى يستقر التعريض التلقائي (AE) لمستشعر الكاميرا
+                        if (frameCounter.incrementAndGet() < 2) {
+                            img.close();
+                            return;
+                        }
+
+                        android.media.Image.Plane yPlane = img.getPlanes()[0];
+                        java.nio.ByteBuffer buf = yPlane.getBuffer();
+                        int rowStride = yPlane.getRowStride();
+                        int pixelStride = yPlane.getPixelStride();
+                        int iw = img.getWidth();
+                        int ih = img.getHeight();
+                        long sum = 0;
+                        int count = 0;
+                        for (int row = ih / 4; row < (ih * 3) / 4; row += 2) {
+                            int rowStart = row * rowStride;
+                            for (int col = iw / 4; col < (iw * 3) / 4; col += 2) {
+                                int idx = rowStart + col * pixelStride;
+                                if (idx < buf.limit()) {
+                                    sum += (buf.get(idx) & 0xFF);
+                                    count++;
+                                }
+                            }
+                        }
+                        if (count > 0) {
+                            meanLuma = (float) sum / count;
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (img != null) {
+                            try {
+                                img.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+
+                    final boolean isDark = meanLuma < CAMERA_DARK_LUMA_THRESHOLD;
+                    if (finished.compareAndSet(false, true)) {
+                        cleanupAndFinish.run();
+                        mainH.post(() -> {
+                            if (scanGeneration == generation && scanWasActive) {
+                                callback.onResult(isDark);
+                            }
+                        });
+                    }
+                }, camHandler);
+
+                cm.openCamera(frontId, new android.hardware.camera2.CameraDevice.StateCallback() {
+                    @Override
+                    public void onOpened(android.hardware.camera2.CameraDevice camera) {
+                        if (finished.get()) {
+                            camera.close();
+                            return;
+                        }
+                        devRef[0] = camera;
+                        try {
+                            android.hardware.camera2.CaptureRequest.Builder req = camera.createCaptureRequest(
+                                    android.hardware.camera2.CameraDevice.TEMPLATE_PREVIEW);
+                            req.addTarget(reader.getSurface());
+                            req.set(android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE,
+                                    android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE_ON);
+
+                            camera.createCaptureSession(
+                                    java.util.Collections.singletonList(reader.getSurface()),
+                                    new android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                                        @Override
+                                        public void onConfigured(android.hardware.camera2.CameraCaptureSession session) {
+                                            if (finished.get()) return;
+                                            try {
+                                                session.setRepeatingRequest(req.build(), null, camHandler);
+                                            } catch (Throwable ignored) {
+                                            }
+                                        }
+
+                                        @Override
+                                        public void onConfigureFailed(android.hardware.camera2.CameraCaptureSession session) {
+                                        }
+                                    },
+                                    camHandler
+                            );
+                        } catch (Throwable ignored) {
+                        }
+                    }
+
+                    @Override
+                    public void onDisconnected(android.hardware.camera2.CameraDevice camera) {
+                        camera.close();
+                    }
+
+                    @Override
+                    public void onError(android.hardware.camera2.CameraDevice camera, int error) {
+                        camera.close();
+                    }
+                }, camHandler);
+            } catch (Throwable ignored) {
+                if (finished.compareAndSet(false, true)) {
+                    cleanupAndFinish.run();
+                    mainH.post(() -> {
+                        if (scanGeneration == generation && scanWasActive) callback.onResult(false);
+                    });
+                }
+            }
+        });
+    }
+
+    private void scheduleSecondRealScan(Context context, int generation) {
         cancelPendingSecondScan();
         android.os.Handler h = getScanHandler();
         if (h == null) return;
 
         secondScanRunnable = () -> {
-            if (!scanWasActive || unlockedInCurrentCycle || context == null) return;
+            if (!scanWasActive || unlockedInCurrentCycle || context == null || scanGeneration != generation) return;
             try {
+                // 1. إيقاف الجلسة الأولى في FaceGuard لتحرير الكاميرا بالكامل
                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
-                FaceIdOverlay.triggerRetryPulse();
 
+                // 2. تشغيل الأنيميشن الانتقالي الواضح بين المحاولتين
+                FaceIdOverlay.triggerRetryTransition();
+
+                // 3. الانتظار 600ms لإغلاق الكاميرا تماماً ثم بدء جلسة مسح ثانية حقيقية
                 android.os.Handler innerH = getScanHandler();
                 if (innerH != null) {
                     innerH.postDelayed(() -> {
-                        if (scanWasActive && !unlockedInCurrentCycle) {
+                        if (scanWasActive && !unlockedInCurrentCycle && scanGeneration == generation) {
                             try {
                                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
                                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
@@ -296,7 +500,7 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
         h.postDelayed(secondScanRunnable, FIRST_SCAN_WINDOW_MS);
-            }
+    }
 
     private void hookEarlyUnlock(Context context, boolean newAwakeKeyguard) throws Throwable {
         if (newAwakeKeyguard) {
@@ -305,12 +509,20 @@ public class Module implements IXposedHookLoadPackage {
             }
             scanWasActive = true;
             unlockedInCurrentCycle = false;
-            FaceIdOverlay.showScanning(context);
-            context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
-                    .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
+            final int currentGen = ++scanGeneration;
 
-            scheduleSecondRealScan(context);
+            // فحص الإضاءة عبر الكاميرا الأمامية أولاً قبل تشغيل FaceGuard
+            checkDarknessViaFrontCamera(context, currentGen, isDark -> {
+                if (!scanWasActive || unlockedInCurrentCycle || scanGeneration != currentGen) return;
+
+                FaceIdOverlay.showScanning(context, isDark);
+                context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                        .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
+
+                scheduleSecondRealScan(context, currentGen);
+            });
         } else {
+            scanGeneration++;
             cancelPendingSecondScan();
             if (scanWasActive && !unlockedInCurrentCycle) {
                 failedScanAttempts++;
@@ -467,5 +679,4 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
     }
-}
-
+                    }
