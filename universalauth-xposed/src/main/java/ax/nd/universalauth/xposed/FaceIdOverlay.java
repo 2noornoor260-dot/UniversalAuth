@@ -18,6 +18,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.Display;
 import android.view.Gravity;
@@ -27,8 +28,10 @@ import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.LinearInterpolator;
 import android.view.animation.OvershootInterpolator;
+import android.widget.Toast;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 
 public class FaceIdOverlay extends View {
 
@@ -36,12 +39,15 @@ public class FaceIdOverlay extends View {
     private static final int STATE_SUCCESS = 1;
     private static final int STATE_FAILURE = 2;
 
-    private static final long SCAN_TIMEOUT_MS = 6000L; // يغطي محاولتي مسح حقيقيتين كاملتين
+    private static final long SCAN_TIMEOUT_MS = 6200L;
 
     private static FaceIdOverlay instance;
     private static View fillLightView;
     private static WindowManager.LayoutParams fillLightParams;
     private static ValueAnimator fillLightAnimator;
+    private static boolean hardwareBrightnessBoosted = false;
+    private static float savedBrightnessBeforeBoost = 0.4f;
+    private static long lastPinToastTime = 0L;
 
     private static Handler mainHandler;
 
@@ -100,17 +106,49 @@ public class FaceIdOverlay extends View {
     }
 
     public static void showScanning(Context context) {
-        showScanning(context, false);
-    }
-
-    public static void showScanning(Context context, boolean isDarkEnvironment) {
         if (context == null) return;
         Handler h = getMainHandler();
         if (h == null) return;
-        h.post(() -> showScanningInternal(context, isDarkEnvironment));
+        h.post(() -> showScanningInternal(context));
     }
 
-    private static void showScanningInternal(Context context, boolean isDarkEnvironment) {
+    public static void enableFillLight(Context context) {
+        if (context == null) return;
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            if (instance != null && instance.state == STATE_SCANNING && instance.isAttachedToWindow()) {
+                showSmoothFillLight(context.getApplicationContext());
+            }
+        });
+    }
+
+    public static void showPinRequired(Context context) {
+        if (context == null) return;
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            long now = System.currentTimeMillis();
+            if (now - lastPinToastTime > 4000L) {
+                lastPinToastTime = now;
+                try {
+                    Toast.makeText(context.getApplicationContext(),
+                            "مطلوب رمز PIN بعد 45 دقيقة من عدم الاستخدام",
+                            Toast.LENGTH_SHORT).show();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (instance == null || !instance.isAttachedToWindow()) {
+                showScanningInternal(context);
+            }
+            if (instance != null) {
+                h.removeCallbacks(timeoutRunnable);
+                instance.triggerFailureAnimation();
+            }
+        });
+    }
+
+    private static void showScanningInternal(Context context) {
         try {
             if (instance != null && instance.isAttachedToWindow()) {
                 if (instance.state == STATE_SCANNING) return;
@@ -120,10 +158,6 @@ public class FaceIdOverlay extends View {
             Context appCtx = context.getApplicationContext();
             WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
             if (wm == null) return;
-
-            if (isDarkEnvironment) {
-                showSmoothFillLight(appCtx);
-            }
 
             FaceIdOverlay view = new FaceIdOverlay(appCtx);
             int sizePx = dp(appCtx, 68);
@@ -186,7 +220,6 @@ public class FaceIdOverlay extends View {
             view.invalidate();
             view.vibrateRetryTick();
 
-            // 1. اهتزاز أفقي واضح وتصغير للكبسولة للإشارة إلى فشل المحاولة الأولى
             float d = dp(view.getContext(), 7);
             ObjectAnimator shake = ObjectAnimator.ofFloat(
                     view,
@@ -203,7 +236,6 @@ public class FaceIdOverlay extends View {
                     .setDuration(220)
                     .withEndAction(() -> {
                         if (instance != null && instance.isAttachedToWindow()) {
-                            // 2. نبضة توسّع نشطة لبدء المحاولة الثانية الحقيقية
                             instance.isRetrying = false;
                             instance.invalidate();
                             instance.animate()
@@ -226,75 +258,116 @@ public class FaceIdOverlay extends View {
         });
     }
 
-    private static void showSmoothFillLight(Context appCtx) {
-        Handler h = getMainHandler();
-        if (h == null) return;
-        h.post(() -> {
-            try {
-                if (fillLightView != null) return;
-                WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
-                if (wm == null) return;
-
-                View lightPanel = new View(appCtx);
-                lightPanel.setBackgroundColor(Color.WHITE);
-                lightPanel.setAlpha(0f);
-
-                int[] windowTypes = new int[]{
-                        2024,
-                        2015,
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                };
-
-                for (int type : windowTypes) {
-                    try {
-                        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                                WindowManager.LayoutParams.MATCH_PARENT,
-                                WindowManager.LayoutParams.MATCH_PARENT,
-                                type,
-                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
-                                PixelFormat.TRANSLUCENT
-                        );
-                        params.screenBrightness = 0.15f;
-                        applyTrustedOverlayFlag(params);
-
-                        wm.addView(lightPanel, params);
-                        fillLightView = lightPanel;
-                        fillLightParams = params;
-
-                        // إبقاء كبسولة Face ID فوق طبقة الإضاءة البيضاء
-                        if (instance != null && instance.isAttachedToWindow()) {
-                            wm.removeViewImmediate(instance);
-                            wm.addView(instance, instance.layoutParams);
-                        }
-
-                        // تدرج سريع وسلس خلال 450ms وصولاً إلى 100% سطوع كامل
-                        if (fillLightAnimator != null) fillLightAnimator.cancel();
-                        fillLightAnimator = ValueAnimator.ofFloat(0f, 1f);
-                        fillLightAnimator.setDuration(450L);
-                        fillLightAnimator.setInterpolator(new DecelerateInterpolator());
-                        fillLightAnimator.addUpdateListener(anim -> {
-                            float p = (float) anim.getAnimatedValue();
-                            if (fillLightView != null && fillLightParams != null && fillLightView.isAttachedToWindow()) {
-                                fillLightView.setAlpha(p * 0.96f);
-                                fillLightParams.screenBrightness = 0.15f + (p * 0.85f);
-                                try {
-                                    wm.updateViewLayout(fillLightView, fillLightParams);
-                                } catch (Throwable ignored) {
-                                }
-                            }
-                        });
-                        fillLightAnimator.start();
-                        break;
-                    } catch (Throwable ignored) {
-                    }
-                }
-            } catch (Throwable ignored) {
+    private static void setHardwareDisplayBrightness(Context ctx, float brightness) {
+        try {
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                Method setTemp = DisplayManager.class.getMethod("setTemporaryBrightness", int.class, float.class);
+                setTemp.invoke(dm, Display.DEFAULT_DISPLAY, brightness);
+                hardwareBrightnessBoosted = !Float.isNaN(brightness);
             }
-        });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static float readCurrentDisplayBrightness(Context ctx) {
+        try {
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                Method getBright = DisplayManager.class.getMethod("getBrightness", int.class);
+                Object val = getBright.invoke(dm, Display.DEFAULT_DISPLAY);
+                if (val instanceof Float && !Float.isNaN((Float) val) && (Float) val > 0f) {
+                    return (Float) val;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            int sysVal = Settings.System.getInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 100);
+            return Math.max(0.05f, Math.min(1.0f, sysVal / 255f));
+        } catch (Throwable ignored) {
+        }
+        return 0.35f;
+    }
+
+    private static void showSmoothFillLight(Context appCtx) {
+        try {
+            if (fillLightView != null) return;
+            WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
+            if (wm == null) return;
+
+            savedBrightnessBeforeBoost = readCurrentDisplayBrightness(appCtx);
+
+            View lightPanel = new View(appCtx);
+            lightPanel.setBackgroundColor(Color.WHITE);
+            lightPanel.setAlpha(0f);
+
+            int[] windowTypes = new int[]{
+                    2015, // TYPE_SECURE_SYSTEM_OVERLAY (تحت الكبسولة مباشرة)
+                    2024,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            };
+
+            for (int type : windowTypes) {
+                try {
+                    WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                            WindowManager.LayoutParams.MATCH_PARENT,
+                            WindowManager.LayoutParams.MATCH_PARENT,
+                            type,
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                            PixelFormat.TRANSLUCENT
+                    );
+                    params.screenBrightness = 1.0f;
+                    applyTrustedOverlayFlag(params);
+
+                    wm.addView(lightPanel, params);
+                    fillLightView = lightPanel;
+                    fillLightParams = params;
+
+                    // ضمان بقاء كبسولة Face ID فوق الطبقة البيضاء دائماً
+                    if (instance != null && instance.isAttachedToWindow()) {
+                        wm.removeViewImmediate(instance);
+                        wm.addView(instance, instance.layoutParams);
+                    }
+
+                    // تدرج سريع وسلس خلال 420ms من السطوع الحالي حتى 100% سطوع كامل
+                    if (fillLightAnimator != null) fillLightAnimator.cancel();
+                    final float startB = savedBrightnessBeforeBoost;
+                    fillLightAnimator = ValueAnimator.ofFloat(0f, 1f);
+                    fillLightAnimator.setDuration(420L);
+                    fillLightAnimator.setInterpolator(new DecelerateInterpolator());
+                    fillLightAnimator.addUpdateListener(anim -> {
+                        float p = (float) anim.getAnimatedValue();
+                        float targetBrightness = startB + (p * (1.0f - startB));
+                        setHardwareDisplayBrightness(appCtx, targetBrightness);
+
+                        if (fillLightView != null && fillLightView.isAttachedToWindow()) {
+                            fillLightView.setAlpha(p * 0.98f);
+                        }
+                    });
+                    fillLightAnimator.start();
+                    break;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void restoreDisplayBrightness(Context ctx) {
+        if (!hardwareBrightnessBoosted || ctx == null) return;
+        try {
+            setHardwareDisplayBrightness(ctx, Float.NaN);
+        } catch (Throwable ignored) {
+        }
+        if (hardwareBrightnessBoosted) {
+            setHardwareDisplayBrightness(ctx, savedBrightnessBeforeBoost);
+            hardwareBrightnessBoosted = false;
+        }
     }
 
     private static void hideSmoothFillLight(boolean immediate) {
@@ -304,12 +377,15 @@ public class FaceIdOverlay extends View {
         }
         if (fillLightView == null) return;
         View panel = fillLightView;
+        Context ctx = panel.getContext();
         fillLightView = null;
         fillLightParams = null;
 
+        restoreDisplayBrightness(ctx);
+
         if (immediate) {
             try {
-                WindowManager wm = (WindowManager) panel.getContext().getSystemService(Context.WINDOW_SERVICE);
+                WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
                 if (wm != null && panel.isAttachedToWindow()) {
                     wm.removeView(panel);
                 }
@@ -320,13 +396,13 @@ public class FaceIdOverlay extends View {
 
         panel.animate()
                 .alpha(0f)
-                .setDuration(260)
+                .setDuration(240)
                 .setInterpolator(new DecelerateInterpolator())
                 .setListener(new AnimatorListenerAdapter() {
                     @Override
                     public void onAnimationEnd(Animator animation) {
                         try {
-                            WindowManager wm = (WindowManager) panel.getContext().getSystemService(Context.WINDOW_SERVICE);
+                            WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
                             if (wm != null && panel.isAttachedToWindow()) {
                                 wm.removeView(panel);
                             }
@@ -354,7 +430,7 @@ public class FaceIdOverlay extends View {
             hideSmoothFillLight(false);
 
             if (instance == null || !instance.isAttachedToWindow()) {
-                showScanningInternal(context, false);
+                showScanningInternal(context);
             }
             if (instance != null) {
                 instance.triggerSuccessAnimation();
@@ -815,4 +891,4 @@ public class FaceIdOverlay extends View {
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-    }
+            }
