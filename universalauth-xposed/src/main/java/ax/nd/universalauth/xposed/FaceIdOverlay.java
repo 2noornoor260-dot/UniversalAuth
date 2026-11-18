@@ -7,11 +7,13 @@ import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PathMeasure;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
@@ -42,7 +44,8 @@ public class FaceIdOverlay extends View {
     private static final long SCAN_TIMEOUT_MS = 6200L;
 
     private static FaceIdOverlay instance;
-    private static View fillLightView;
+    private static SoftFillLightView fillLightView;
+    private static WindowManager.LayoutParams fillLightParams;
     private static ValueAnimator fillLightAnimator;
     private static boolean hardwareBrightnessBoosted = false;
     private static float savedBrightnessBeforeBoost = 0.4f;
@@ -94,9 +97,9 @@ public class FaceIdOverlay extends View {
         bgPaint.setColor(Color.parseColor("#F50C0C0F"));
         bgPaint.setStyle(Paint.Style.FILL);
 
-        borderPaint.setColor(Color.parseColor("#33FFFFFF"));
+        borderPaint.setColor(Color.parseColor("#4DFFFFFF"));
         borderPaint.setStyle(Paint.Style.STROKE);
-        borderPaint.setStrokeWidth(dp(context, 1.2f));
+        borderPaint.setStrokeWidth(dp(context, 1.3f));
 
         glyphPaint.setColor(Color.parseColor("#F2F2F7"));
         glyphPaint.setStyle(Paint.Style.STROKE);
@@ -161,11 +164,11 @@ public class FaceIdOverlay extends View {
             FaceIdOverlay view = new FaceIdOverlay(appCtx);
             int sizePx = dp(appCtx, 68);
 
-            // استخدام أعلى طبقة للكبسولة (2015 TYPE_SECURE_SYSTEM_OVERLAY) لتبقى دائماً فوق طبقة الإضاءة البيضاء
+            // أعلى طبقة للكبسولة (2015 TYPE_SECURE_SYSTEM_OVERLAY) لتبقى دائماً فوق الإضاءة البيضاء
             int[] windowTypes = new int[]{
                     2015, // TYPE_SECURE_SYSTEM_OVERLAY (Layer 29)
-                    2024, // TYPE_NAVIGATION_BAR_PANEL (Layer 24)
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // (Layer 21)
+                    2026, // TYPE_DISPLAY_OVERLAY (Layer 28)
+                    2024  // TYPE_NAVIGATION_BAR_PANEL (Layer 24)
             };
 
             boolean added = false;
@@ -262,8 +265,13 @@ public class FaceIdOverlay extends View {
         try {
             DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
             if (dm != null) {
-                Method setTemp = DisplayManager.class.getMethod("setTemporaryBrightness", int.class, float.class);
-                setTemp.invoke(dm, Display.DEFAULT_DISPLAY, brightness);
+                try {
+                    Method setTemp = DisplayManager.class.getMethod("setTemporaryBrightness", int.class, float.class);
+                    setTemp.invoke(dm, Display.DEFAULT_DISPLAY, brightness);
+                } catch (NoSuchMethodException e) {
+                    Method setTempOld = DisplayManager.class.getMethod("setTemporaryBrightness", float.class);
+                    setTempOld.invoke(dm, brightness);
+                }
                 hardwareBrightnessBoosted = !Float.isNaN(brightness);
             }
         } catch (Throwable ignored) {
@@ -290,6 +298,84 @@ public class FaceIdOverlay extends View {
         return 0.35f;
     }
 
+    /**
+     * طبقة إضاءة ناعمة وشفافة مع إطار أبيض متدرج عالي السطوع لإنارة الوجه دون حجب شاشة القفل بالكامل
+     */
+    private static class SoftFillLightView extends View {
+        private final Paint centerVeilPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint edgeGlowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float intensity = 0f;
+
+        private int cachedW = -1;
+        private int cachedH = -1;
+        private LinearGradient topGrad;
+        private LinearGradient bottomGrad;
+        private LinearGradient leftGrad;
+        private LinearGradient rightGrad;
+
+        public SoftFillLightView(Context context) {
+            super(context);
+            centerVeilPaint.setColor(Color.WHITE);
+            centerVeilPaint.setStyle(Paint.Style.FILL);
+        }
+
+        public void setIntensity(float value) {
+            this.intensity = Math.max(0f, Math.min(1f, value));
+            invalidate();
+        }
+
+        private void ensureShaders(int w, int h) {
+            if (w == cachedW && h == cachedH && topGrad != null) return;
+            cachedW = w;
+            cachedH = h;
+
+            float frameDepth = Math.min(w, h) * 0.24f;
+            int edgeColor = Color.argb(248, 255, 255, 255); // حافة بيضاء ناصعة 97%
+            int midColor = Color.argb(135, 255, 255, 255);  // تدرج ناعم
+            int innerColor = Color.argb(0, 255, 255, 255);  // تلاشي شفاف نحو المنتصف
+
+            int[] colors = new int[]{edgeColor, midColor, innerColor};
+            float[] stops = new float[]{0f, 0.42f, 1f};
+
+            topGrad = new LinearGradient(0f, 0f, 0f, frameDepth, colors, stops, Shader.TileMode.CLAMP);
+            bottomGrad = new LinearGradient(0f, h, 0f, h - frameDepth, colors, stops, Shader.TileMode.CLAMP);
+            leftGrad = new LinearGradient(0f, 0f, frameDepth, 0f, colors, stops, Shader.TileMode.CLAMP);
+            rightGrad = new LinearGradient(w, 0f, w - frameDepth, 0f, colors, stops, Shader.TileMode.CLAMP);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (intensity <= 0.001f) return;
+
+            int w = getWidth();
+            int h = getHeight();
+            if (w <= 0 || h <= 0) return;
+
+            ensureShaders(w, h);
+
+            // 1. غشاء أبيض ناعم وشفاف على كامل الشاشة (يصل إلى ~76% لرفع الإضاءة مع إبقاء الساعة واضحة)
+            centerVeilPaint.setAlpha(Math.round(intensity * 195f));
+            canvas.drawRect(0f, 0f, w, h, centerVeilPaint);
+
+            // 2. إطار أبيض ناعم ومتدرج حول الحواف الأربع لزيادة سطوع الإضاءة على الوجه
+            float frameDepth = Math.min(w, h) * 0.24f;
+            edgeGlowPaint.setAlpha(Math.round(intensity * 255f));
+
+            edgeGlowPaint.setShader(topGrad);
+            canvas.drawRect(0f, 0f, w, frameDepth, edgeGlowPaint);
+
+            edgeGlowPaint.setShader(bottomGrad);
+            canvas.drawRect(0f, h - frameDepth, w, h, edgeGlowPaint);
+
+            edgeGlowPaint.setShader(leftGrad);
+            canvas.drawRect(0f, 0f, frameDepth, h, edgeGlowPaint);
+
+            edgeGlowPaint.setShader(rightGrad);
+            canvas.drawRect(w - frameDepth, 0f, w, h, edgeGlowPaint);
+        }
+    }
+
     private static void showSmoothFillLight(Context appCtx) {
         try {
             if (fillLightView != null) return;
@@ -298,15 +384,13 @@ public class FaceIdOverlay extends View {
 
             savedBrightnessBeforeBoost = readCurrentDisplayBrightness(appCtx);
 
-            View lightPanel = new View(appCtx);
-            lightPanel.setBackgroundColor(Color.WHITE);
-            lightPanel.setAlpha(0f);
+            SoftFillLightView lightPanel = new SoftFillLightView(appCtx);
 
-            // استخدام طبقات أدنى من كبسولة Face ID (2015) حتى تظل الكبسولة ظاهرة فوق الإضاءة البيضاء دائماً
+            // طبقات النظام فوق شاشة القفل مباشرة وأدنى من كبسولة Face ID (2015)
             int[] windowTypes = new int[]{
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, // Layer 21 (أدنى من 2015 و 2024)
-                    2024, // TYPE_NAVIGATION_BAR_PANEL (Layer 24 - أدنى من 2015)
-                    2006  // TYPE_SYSTEM_OVERLAY (Layer 17)
+                    2024, // TYPE_NAVIGATION_BAR_PANEL (Layer 24 - فوق شاشة القفل وتحت 2015)
+                    2026, // TYPE_DISPLAY_OVERLAY (Layer 28 - فوق شاشة القفل وتحت 2015)
+                    2015  // TYPE_SECURE_SYSTEM_OVERLAY (احتياطي)
             };
 
             for (int type : windowTypes) {
@@ -322,13 +406,20 @@ public class FaceIdOverlay extends View {
                                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
                             PixelFormat.TRANSLUCENT
                     );
-                    params.screenBrightness = 1.0f;
+                    params.screenBrightness = savedBrightnessBeforeBoost;
                     applyTrustedOverlayFlag(params);
 
                     wm.addView(lightPanel, params);
                     fillLightView = lightPanel;
+                    fillLightParams = params;
 
-                    // تدرج سريع وسلس خلال 400ms من السطوع الحالي حتى 100% سطوع كامل
+                    // إذا اضطر النظام لاستخدام الطبقة 2015، نعيد إضافة الكبسولة فوقها فوراً
+                    if (type == 2015 && instance != null && instance.isAttachedToWindow()) {
+                        wm.removeViewImmediate(instance);
+                        wm.addView(instance, instance.layoutParams);
+                    }
+
+                    // تدرج سريع وسلس خلال 400ms للوصول إلى 100% من أقصى سطوع للشاشة والإطار الأبيض
                     if (fillLightAnimator != null) fillLightAnimator.cancel();
                     final float startB = savedBrightnessBeforeBoost;
                     fillLightAnimator = ValueAnimator.ofFloat(0f, 1f);
@@ -337,10 +428,18 @@ public class FaceIdOverlay extends View {
                     fillLightAnimator.addUpdateListener(anim -> {
                         float p = (float) anim.getAnimatedValue();
                         float targetBrightness = startB + (p * (1.0f - startB));
+
                         setHardwareDisplayBrightness(appCtx, targetBrightness);
 
                         if (fillLightView != null && fillLightView.isAttachedToWindow()) {
-                            fillLightView.setAlpha(p * 0.94f);
+                            fillLightView.setIntensity(p);
+                            if (fillLightParams != null) {
+                                fillLightParams.screenBrightness = targetBrightness;
+                                try {
+                                    wm.updateViewLayout(fillLightView, fillLightParams);
+                                } catch (Throwable ignored) {
+                                }
+                            }
                         }
                     });
                     fillLightAnimator.start();
@@ -370,9 +469,10 @@ public class FaceIdOverlay extends View {
             fillLightAnimator = null;
         }
         if (fillLightView == null) return;
-        View panel = fillLightView;
+        SoftFillLightView panel = fillLightView;
         Context ctx = panel.getContext();
         fillLightView = null;
+        fillLightParams = null;
 
         restoreDisplayBrightness(ctx);
 
@@ -755,8 +855,8 @@ public class FaceIdOverlay extends View {
             borderPaint.setColor(Color.parseColor("#CCFF6B35"));
             borderPaint.setStrokeWidth(dp(getContext(), 1.8f));
         } else {
-            borderPaint.setColor(Color.parseColor("#4DFFFFFF"));
-            borderPaint.setStrokeWidth(dp(getContext(), 1.3f));
+            borderPaint.setColor(Color.parseColor("#66FFFFFF"));
+            borderPaint.setStrokeWidth(dp(getContext(), 1.4f));
         }
 
         float cornerRadius = dp(getContext(), 20) + (morphProgress * (w / 2f));
