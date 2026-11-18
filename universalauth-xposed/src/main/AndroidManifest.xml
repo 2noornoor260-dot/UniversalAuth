@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="ax.nd.universalauth.xposed">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
     <permission
         android:name="ax.nd.universalauth.permission.UNLOCK_DEVICE"
         android:label="@string/unlock_device_permission_label"
@@ -25,5 +30,11 @@
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope"/>
+
+        <service
+            android:name="ax.nd.universalauth.xposed.LivenessVerifierService"
+            android:enabled="true"
+            android:exported="true"
+            android:foregroundServiceType="camera" />
     </application>
 </manifest>
