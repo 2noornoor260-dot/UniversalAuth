@@ -25,31 +25,23 @@ class SmartFaceEngine(context: Context) {
 
     companion object {
         private const val TAG = "SmartFaceEngine"
-        private const val MAX_TEMPLATES = 12
         private const val DB_FILE_NAME = "smart_face_templates_v2.enc"
         const val PREFS_NAME = "smart_face_prefs"
 
-        // مفاتيح الإعدادات القابلة للتحكم من واجهة التطبيق
+        // مفاتيح تجربة الاستخدام القابلة للتحكم من التطبيق
         const val KEY_REQUIRE_EYES = "req_eyes_open"
-        const val KEY_ANTI_SPOOF = "enable_anti_spoof"
-        const val KEY_3D_MESH = "enable_3d_mesh"
         const val KEY_ADAPTIVE = "adaptive_learning"
         const val KEY_NIGHT_LIGHT = "night_fill_light"
         const val KEY_VIBRATE = "vibrate_on_unlock"
-        const val KEY_TURBO_MODE = "turbo_fast_mode"
-        const val KEY_MATCH_THRESHOLD = "match_threshold"
-        const val KEY_SPOOF_THRESHOLD = "spoof_threshold"
-        const val KEY_MAX_ANGLE = "max_head_angle"
 
-        // حالة التسجيل الحي لعرضها في شاشة التسجيل
+        // القيم المثالية المعايرة تلقائياً لأعلى سرعة وأمان على التابلت
+        private const val OPTIMAL_MATCH_THRESHOLD = 0.54f
+        private const val OPTIMAL_SPOOF_THRESHOLD = 0.42f
+        private const val OPTIMAL_3D_DEPTH_MIN = 0.042f
+        private const val OPTIMAL_MAX_HEAD_ANGLE = 32f
+
         @JvmField var currentEnrollHint: String = "الخطوة 1/5: انظر للأمام مباشرة"
         @JvmField var currentEnrollPercent: Float = 0f
-
-        // بيانات الاختبار الحي
-        @JvmField var lastMatchScore: Float = 0f
-        @JvmField var lastRealScore: Float = 0f
-        @JvmField var lastProcessMs: Long = 0L
-        @JvmField var lastStatusText: String = "في انتظار الوجه..."
 
         const val CODE_SUCCESS = 0
         const val CODE_NO_FACE = 5
@@ -86,8 +78,7 @@ class SmartFaceEngine(context: Context) {
     private var encryptor: UnlockEncryptor? = null
     private var workingRotationOverride: Int? = null
 
-    // متغيرات تتبع مراحل التسجيل الـ 5
-    private var enrollStage = 0 // 0: أمام، 1: يمين، 2: يسار، 3: أعلى، 4: أسفل
+    private var enrollStage = 0
     private var stageSamples = 0
     private var stage1YawSign = 1f
 
@@ -96,7 +87,7 @@ class SmartFaceEngine(context: Context) {
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.20f)
+            .setMinFaceSize(0.18f)
             .build()
         faceDetector = FaceDetection.getClient(options)
 
@@ -133,8 +124,6 @@ class SmartFaceEngine(context: Context) {
 
     fun hasEnrolledFace(): Boolean = enrolledTemplates.isNotEmpty()
 
-    fun getTemplateCount(): Int = enrolledTemplates.size
-
     fun resetEnrollProgress() {
         enrollStage = 0
         stageSamples = 0
@@ -148,15 +137,12 @@ class SmartFaceEngine(context: Context) {
         storageDir?.let { File(it, DB_FILE_NAME).delete() }
     }
 
-    /**
-     * تسجيل الوجه على 5 مراحل تفصيلية (أمام - يمين - يسار - أعلى - أسفل)
-     */
     fun enrollFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int): Int {
         if (enrollStage == 0 && stageSamples == 0 && enrolledTemplates.isNotEmpty()) {
             enrolledTemplates.clear()
         }
 
-        val (bitmap, faces) = detectWithAutoRotation(nv21, width, height, rotation)
+        val (bitmap, faces) = detectFastNV21(nv21, width, height, rotation)
         if (bitmap == null || faces.isEmpty()) {
             currentEnrollHint = "ضع وجهك بوضوح أمام الكاميرا"
             return CODE_NO_FACE
@@ -168,11 +154,11 @@ class SmartFaceEngine(context: Context) {
 
         val face = faces[0]
         val faceRatio = face.boundingBox.width().toFloat() / bitmap.width.toFloat()
-        if (faceRatio < 0.20f) {
+        if (faceRatio < 0.18f) {
             currentEnrollHint = "اقترب قليلاً من الكاميرا"
             return CODE_TOO_SMALL
         }
-        if (faceRatio > 0.88f) {
+        if (faceRatio > 0.90f) {
             currentEnrollHint = "ابتعد قليلاً عن الكاميرا"
             return CODE_TOO_LARGE
         }
@@ -198,11 +184,11 @@ class SmartFaceEngine(context: Context) {
             }
             3 -> {
                 currentEnrollHint = "الخطوة 4/5: ارفع رأسك قليلاً للأعلى ⬆"
-                pitch in 9f..32f
+                pitch in 8f..32f
             }
             4 -> {
                 currentEnrollHint = "الخطوة 5/5: اخفض رأسك قليلاً للأسفل ⬇"
-                pitch in -32f..-9f
+                pitch in -32f..-8f
             }
             else -> true
         }
@@ -217,9 +203,8 @@ class SmartFaceEngine(context: Context) {
         enrolledTemplates.add(embedding)
         stageSamples++
 
-        val totalSteps = 10f // 5 مراحل × لقطتين لكل مرحلة
         val completedSteps = (enrollStage * 2 + stageSamples).toFloat()
-        currentEnrollPercent = ((completedSteps / totalSteps) * 100f).coerceIn(5f, 100f)
+        currentEnrollPercent = ((completedSteps / 10f) * 100f).coerceIn(5f, 100f)
 
         if (stageSamples >= 2) {
             enrollStage++
@@ -245,121 +230,93 @@ class SmartFaceEngine(context: Context) {
         }
     }
 
-    /**
-     * التحقق من الوجه لفتح القفل مع تطبيق إعدادات المستخدم الفورية
-     */
     fun verifyFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int): Int {
-        val startMs = System.currentTimeMillis()
-        if (enrolledTemplates.isEmpty()) {
-            lastStatusText = "لا يوجد وجه مسجل"
-            return CODE_MISMATCH
-        }
+        if (enrolledTemplates.isEmpty()) return CODE_MISMATCH
 
         val requireEyesOpen = prefs.getBoolean(KEY_REQUIRE_EYES, true)
-        val enableAntiSpoof = prefs.getBoolean(KEY_ANTI_SPOOF, true)
-        val enable3DMesh = prefs.getBoolean(KEY_3D_MESH, true)
         val adaptiveLearning = prefs.getBoolean(KEY_ADAPTIVE, true)
-        val matchThreshold = prefs.getFloat(KEY_MATCH_THRESHOLD, 0.65f)
-        val spoofThreshold = prefs.getFloat(KEY_SPOOF_THRESHOLD, 0.60f)
-        val maxAngle = prefs.getFloat(KEY_MAX_ANGLE, 28f)
 
-        val (bitmap, faces) = detectWithAutoRotation(nv21, width, height, rotation)
-        if (bitmap == null || faces.isEmpty()) {
-            lastProcessMs = System.currentTimeMillis() - startMs
-            lastStatusText = "لم يتم رصد وجه"
-            return CODE_NO_FACE
-        }
+        val (bitmap, faces) = detectFastNV21(nv21, width, height, rotation)
+        if (bitmap == null || faces.isEmpty()) return CODE_NO_FACE
 
         val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
             ?: return CODE_NO_FACE
 
-        if (abs(face.headEulerAngleY) > maxAngle || abs(face.headEulerAngleZ) > maxAngle) {
-            lastProcessMs = System.currentTimeMillis() - startMs
-            lastStatusText = "زاوية الرأس مائلة"
+        if (abs(face.headEulerAngleY) > OPTIMAL_MAX_HEAD_ANGLE || abs(face.headEulerAngleZ) > OPTIMAL_MAX_HEAD_ANGLE) {
             return if (face.headEulerAngleY > 0) CODE_ROTATED_LEFT else CODE_ROTATED_RIGHT
         }
 
         if (requireEyesOpen) {
             val left = face.leftEyeOpenProbability ?: 1f
             val right = face.rightEyeOpenProbability ?: 1f
-            if (left < 0.55f || right < 0.55f) {
-                lastProcessMs = System.currentTimeMillis() - startMs
-                lastStatusText = "العين مغلقة (مرفوض)"
+            if (left < 0.50f || right < 0.50f) {
                 return CODE_EYES_CLOSED
             }
         }
 
-        // فحص العمق ثلاثي الأبعاد عبر ML Kit Face Mesh (468 نقطة)
-        if (enable3DMesh) {
-            val meshes = runCatching {
-                Tasks.await(meshDetector.process(InputImage.fromBitmap(bitmap, 0)), 600, TimeUnit.MILLISECONDS)
-            }.getOrNull()
-            if (!meshes.isNullOrEmpty()) {
-                val points = meshes[0].allPoints
-                if (points.size >= 400) {
-                    val minZ = points.minOf { it.position.z }
-                    val maxZ = points.maxOf { it.position.z }
-                    val depthSpan = (maxZ - minZ) / max(1, face.boundingBox.width())
-                    if (depthSpan < 0.09f) {
-                        lastProcessMs = System.currentTimeMillis() - startMs
-                        lastStatusText = "وجه مسطح 2D (تم الحظر)"
-                        return CODE_SPOOF_WARNING
-                    }
+        // فحص العمق ثلاثي الأبعاد (مفعّل دائماً ومعاير لمسافة التابلت)
+        val meshes = runCatching {
+            Tasks.await(meshDetector.process(InputImage.fromBitmap(bitmap, 0)), 400, TimeUnit.MILLISECONDS)
+        }.getOrNull()
+        if (!meshes.isNullOrEmpty()) {
+            val points = meshes[0].allPoints
+            if (points.size >= 400) {
+                val minZ = points.minOf { it.position.z }
+                val maxZ = points.maxOf { it.position.z }
+                val depthSpan = (maxZ - minZ) / max(1, face.boundingBox.width())
+                if (depthSpan < OPTIMAL_3D_DEPTH_MIN) {
+                    return CODE_SPOOF_WARNING
                 }
             }
         }
 
-        // فحص كشف التزييف بالذكاء الاصطناعي (MiniFASNet / FaceAntiSpoofing)
-        if (enableAntiSpoof && antiSpoofInterpreter != null) {
+        // كشف التزييف بالذكاء الاصطناعي (مفعّل دائماً)
+        if (antiSpoofInterpreter != null) {
             val spoofCrop = cropExpanded(bitmap, face.boundingBox, scale = 2.0f, targetSize = spoofInputSize)
             val realScore = runAntiSpoofing(spoofCrop)
-            lastRealScore = realScore
-            if (realScore < spoofThreshold) {
-                lastProcessMs = System.currentTimeMillis() - startMs
-                lastStatusText = "محاولة تزييف (${(realScore * 100).toInt()}%)"
+            if (realScore < OPTIMAL_SPOOF_THRESHOLD) {
                 return CODE_SPOOF_WARNING
             }
-        } else {
-            lastRealScore = 1.0f
         }
 
-        // مطابقة بصمة الوجه (InsightFace)
+        // مطابقة البصمة
         val aligned = alignAndCrop(bitmap, face, recInputSize)
         val currentEmbedding = extractEmbedding(aligned) ?: return CODE_MISMATCH
 
         val bestScore = enrolledTemplates.maxOfOrNull { cosineSimilarity(currentEmbedding, it) } ?: 0f
-        lastMatchScore = bestScore
-        lastProcessMs = System.currentTimeMillis() - startMs
 
-        return if (bestScore >= matchThreshold) {
-            lastStatusText = "تم التعرف بنجاح ✓ (${(bestScore * 100).toInt()}%)"
-            if (adaptiveLearning && bestScore in (matchThreshold + 0.14f)..0.95f && enrolledTemplates.size >= 5) {
+        return if (bestScore >= OPTIMAL_MATCH_THRESHOLD) {
+            if (adaptiveLearning && bestScore in 0.68f..0.95f && enrolledTemplates.size >= 5) {
                 enrolledTemplates.removeAt(2)
                 enrolledTemplates.add(currentEmbedding)
                 saveTemplates()
             }
             CODE_SUCCESS
         } else {
-            lastStatusText = "الوجه غير متطابق (${(bestScore * 100).toInt()}%)"
             CODE_MISMATCH
         }
     }
 
-    private fun detectWithAutoRotation(nv21: ByteArray, width: Int, height: Int, requestedRotation: Int): Pair<Bitmap?, List<Face>> {
-        val raw = nv21ToBitmap(nv21, width, height) ?: return Pair(null, emptyList())
+    /**
+     * اكتشاف فائق السرعة مباشرة على بيانات NV21 الخام دون ضغط صور متكرر
+     */
+    private fun detectFastNV21(nv21: ByteArray, width: Int, height: Int, requestedRotation: Int): Pair<Bitmap?, List<Face>> {
         val candidates = listOfNotNull(workingRotationOverride, requestedRotation, 270, 90, 0, 180).distinct()
 
         for (rot in candidates) {
-            val rotated = rotateBitmap(raw, rot)
+            val inputImage = InputImage.fromByteArray(nv21, width, height, rot, InputImage.IMAGE_FORMAT_NV21)
             val faces = runCatching {
-                Tasks.await(faceDetector.process(InputImage.fromBitmap(rotated, 0)), 800, TimeUnit.MILLISECONDS)
+                Tasks.await(faceDetector.process(inputImage), 400, TimeUnit.MILLISECONDS)
             }.getOrNull()
+
             if (!faces.isNullOrEmpty()) {
                 workingRotationOverride = rot
+                val raw = nv21ToBitmap(nv21, width, height) ?: return Pair(null, emptyList())
+                val rotated = rotateBitmap(raw, rot)
                 return Pair(rotated, faces)
             }
         }
-        return Pair(rotateBitmap(raw, requestedRotation), emptyList())
+        return Pair(null, emptyList())
     }
 
     private fun runAntiSpoofing(bitmap: Bitmap): Float {
@@ -371,11 +328,7 @@ class SmartFaceEngine(context: Context) {
 
         val logits = output[0]
         return when {
-            spoofOutputSize == 1 -> {
-                // نموذج FaceAntiSpoofing: القيمة القريبة من 0 تعني حقيقي، والقريبة من 1 تعني مزيف
-                val spoofProb = logits[0].coerceIn(0f, 1f)
-                1.0f - spoofProb
-            }
+            spoofOutputSize == 1 -> 1.0f - logits[0].coerceIn(0f, 1f)
             spoofOutputSize >= 3 -> {
                 val expReal = exp(logits[1].toDouble())
                 val sumExp = logits.sumOf { exp(it.toDouble()) }
@@ -444,7 +397,6 @@ class SmartFaceEngine(context: Context) {
         return Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
     }
 
-    // mode: 0 = [0..255], 1 = [0..1], 2 = [-1..1]
     private fun bitmapToFloatBuffer(bitmap: Bitmap, mode: Int): ByteBuffer {
         val size = bitmap.width
         val buffer = ByteBuffer.allocateDirect(4 * size * size * 3).order(ByteOrder.nativeOrder())
