@@ -1,6 +1,7 @@
 package ax.nd.faceunlock
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -20,6 +21,7 @@ import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.widget.NestedScrollView
 import ax.nd.faceunlock.backend.FaceUnlockVendorImpl
@@ -29,7 +31,6 @@ import ax.nd.faceunlock.service.RemoveFaceController
 import ax.nd.faceunlock.service.RemoveFaceControllerCallbacks
 import ax.nd.faceunlock.util.SharedUtil
 import ax.nd.universalauth.xposed.common.XposedConstants
-import com.afollestad.materialdialogs.MaterialDialog
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.slider.Slider
@@ -59,7 +60,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         requestUnlockPermsLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
         buildModernDashboard()
-        checkPermissionsSilently()
+        checkAndAskForPermissions()
     }
 
     private fun buildModernDashboard() {
@@ -330,16 +331,12 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         container.addView(metricsText)
 
         isTestingLive = true
-        val dialog = MaterialDialog(this).show {
-            title(text = "اختبار الذكاء الاصطناعي الحي")
-            customView(view = container)
-            positiveButton(text = "إغلاق") {
-                stopLiveCamera()
-            }
-            setOnDismissListener {
-                stopLiveCamera()
-            }
-        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("اختبار الذكاء الاصطناعي الحي")
+            .setView(container)
+            .setPositiveButton("إغلاق") { _, _ -> stopLiveCamera() }
+            .setOnDismissListener { stopLiveCamera() }
+            .show()
 
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -539,10 +536,13 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun checkPermissionsSilently() {
+    fun checkAndAskForPermissions() {
         if (ContextCompat.checkSelfPermission(this, XposedConstants.PERMISSION_UNLOCK_DEVICE) != PackageManager.PERMISSION_GRANTED) {
             requestUnlockPermsLauncher?.launch(XposedConstants.PERMISSION_UNLOCK_DEVICE)
         }
+    }
+
+    fun browseForFiles() {
     }
 
     override fun onResume() {
