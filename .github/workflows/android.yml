@@ -19,6 +19,28 @@ jobs:
         distribution: 'temurin'
         cache: gradle
 
+    - name: Download AI Models for Face Unlock
+      run: |
+        mkdir -p faceunlock-backend/src/main/assets
+        for url in \
+          "https://github.com/MCarlomagno/FaceRecognitionAuth/raw/master/app/src/main/assets/mobile_face_net.tflite" \
+          "https://github.com/estebanuri/face_recognition/raw/master/assets/mobilefacenet.tflite" \
+          "https://github.com/shubham0204/FaceRecognition_With_FaceNet_Android/raw/master/app/src/main/assets/facenet_512.tflite"; do
+          if curl -fL --retry 3 "$url" -o faceunlock-backend/src/main/assets/face_recognition.tflite && [ -s faceunlock-backend/src/main/assets/face_recognition.tflite ]; then
+            echo "Downloaded face_recognition.tflite from $url"
+            break
+          fi
+        done
+        for url in \
+          "https://github.com/syaringan357/Android-Face-Anti-Spoofing/raw/master/app/src/main/assets/FaceAntiSpoofing.tflite" \
+          "https://github.com/GvidoP/FaceAntiSpoofing/raw/master/app/src/main/assets/FaceAntiSpoofing.tflite"; do
+          if curl -fL --retry 3 "$url" -o faceunlock-backend/src/main/assets/minifasnet.tflite && [ -s faceunlock-backend/src/main/assets/minifasnet.tflite ]; then
+            echo "Downloaded minifasnet.tflite from $url"
+            break
+          fi
+        done
+        ls -lh faceunlock-backend/src/main/assets/
+
     - name: Copy XposedUtil source directly
       run: |
         git clone https://github.com/null-dev/XposedUtil.git /tmp/XposedUtil
@@ -30,11 +52,17 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Xposed APK
-      run: ./gradlew :universalauth-xposed:assembleDebug
+    - name: Build APKs
+      run: ./gradlew :universalauth-xposed:assembleDebug :faceunlock:assembleDebug
 
-    - name: Upload APK
+    - name: Upload Xposed APK
       uses: actions/upload-artifact@v4
       with:
         name: universalauth-xposed-a15
         path: universalauth-xposed/build/outputs/apk/debug/*.apk
+
+    - name: Upload FaceUnlock APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: faceunlock-a15
+        path: faceunlock/build/outputs/apk/debug/*.apk
