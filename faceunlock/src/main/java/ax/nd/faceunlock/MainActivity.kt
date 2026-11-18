@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.view.ContextThemeWrapper
@@ -28,8 +31,6 @@ import ax.nd.faceunlock.service.RemoveFaceController
 import ax.nd.faceunlock.service.RemoveFaceControllerCallbacks
 import ax.nd.faceunlock.util.SharedUtil
 import ax.nd.universalauth.xposed.common.XposedConstants
-import com.google.android.material.button.MaterialButton
-import com.google.android.material.card.MaterialCardView
 import com.google.android.material.switchmaterial.SwitchMaterial
 
 class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
@@ -39,189 +40,233 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     private lateinit var prefs: SharedPreferences
     private lateinit var themedCtx: Context
 
+    private lateinit var statusDot: View
     private lateinit var statusTitle: TextView
     private lateinit var statusSubtitle: TextView
-    private lateinit var accessBadge: TextView
-    private lateinit var enrollBtn: MaterialButton
-    private lateinit var systemAuthBtn: MaterialButton
-    private lateinit var removeBtn: MaterialButton
+    private lateinit var accessRowText: TextView
+    private lateinit var enrollRowText: TextView
+    private lateinit var removeRowText: TextView
+
+    private var isDarkTheme = false
+    private var appleBlue = 0
+    private var appleRed = 0
+    private var appleGreen = 0
+    private var textPrimary = 0
+    private var textSecondary = 0
+    private var dividerColor = 0
+    private var cardBgColor = 0
+    private var pageBgColor = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // الحفاظ على ثيم الإعدادات الأصلية مع إضافة خصائص Material الحديثة
-        theme.applyStyle(com.google.android.material.R.style.Theme_MaterialComponents_DayNight_NoActionBar, false)
+        isDarkTheme = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val baseTheme = if (isDarkTheme) {
+            com.google.android.material.R.style.Theme_MaterialComponents_NoActionBar
+        } else {
+            com.google.android.material.R.style.Theme_MaterialComponents_Light_NoActionBar
+        }
+        theme.applyStyle(baseTheme, false)
         theme.applyStyle(androidx.preference.R.style.PreferenceThemeOverlay, true)
         super.onCreate(savedInstanceState)
 
-        themedCtx = ContextThemeWrapper(
-            this,
-            com.google.android.material.R.style.Theme_MaterialComponents_DayNight_NoActionBar
-        )
+        themedCtx = ContextThemeWrapper(this, baseTheme)
         prefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         requestUnlockPermsLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-        buildDashboard(savedInstanceState)
+        initApplePalette()
+        window.statusBarColor = pageBgColor
+        window.navigationBarColor = pageBgColor
+        if (!isDarkTheme) {
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        }
+
+        buildAppleSettingsScreen(savedInstanceState)
         checkAndAskForPermissions()
     }
 
-    private fun buildDashboard(savedInstanceState: Bundle?) {
-        val bgColor = Color.parseColor("#0F1117")
-        val cardColor = Color.parseColor("#1A1E29")
-        val accentColor = Color.parseColor("#4F8EF7")
-        val textPrimary = Color.parseColor("#F4F6FA")
-        val textSecondary = Color.parseColor("#9BA3B4")
+    private fun initApplePalette() {
+        if (isDarkTheme) {
+            pageBgColor = Color.parseColor("#000000")
+            cardBgColor = Color.parseColor("#1C1C1E")
+            dividerColor = Color.parseColor("#2C2C2E")
+            textPrimary = Color.parseColor("#FFFFFF")
+            textSecondary = Color.parseColor("#8E8E93")
+            appleBlue = Color.parseColor("#0A84FF")
+            appleRed = Color.parseColor("#FF453A")
+            appleGreen = Color.parseColor("#30D158")
+        } else {
+            pageBgColor = Color.parseColor("#F2F2F7")
+            cardBgColor = Color.parseColor("#FFFFFF")
+            dividerColor = Color.parseColor("#E5E5EA")
+            textPrimary = Color.parseColor("#000000")
+            textSecondary = Color.parseColor("#8E8E93")
+            appleBlue = Color.parseColor("#007AFF")
+            appleRed = Color.parseColor("#FF3B30")
+            appleGreen = Color.parseColor("#34C759")
+        }
+    }
 
+    private fun buildAppleSettingsScreen(savedInstanceState: Bundle?) {
         val scroll = NestedScrollView(themedCtx).apply {
-            setBackgroundColor(bgColor)
+            setBackgroundColor(pageBgColor)
             isFillViewport = true
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
 
         val root = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(20), dp(16), dp(32))
+            setPadding(dp(16), dp(22), dp(16), dp(36))
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
 
-        // 1. العنوان
+        // عنوان كبير بأسلوب إعدادات آبل
         root.addView(TextView(themedCtx).apply {
-            text = "SmartFace AI Unlock"
-            textSize = 24f
-            typeface = Typeface.DEFAULT_BOLD
+            text = "التعرّف على الوجه"
+            textSize = 30f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             setTextColor(textPrimary)
-        })
-        root.addView(TextView(themedCtx).apply {
-            text = "حماية 3D Face Mesh وكشف التزييف مفعّلان تلقائياً بأقصى سرعة"
-            textSize = 12.5f
-            setTextColor(accentColor)
-            setPadding(0, dp(4), 0, dp(16))
+            setPadding(dp(4), 0, dp(4), dp(18))
         })
 
-        // 2. بطاقة الحالة
-        val statusCard = createCard(cardColor)
-        val statusLayout = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+        // المجموعة 1: حالة النظام وخدمة القفل
+        val statusGroup = createInsetGroup()
+        val statusRow = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
         }
 
+        statusDot = View(themedCtx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).apply { marginEnd = dp(12) }
+        }
+
+        val statusTexts = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
         statusTitle = TextView(themedCtx).apply {
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
+            textSize = 16f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             setTextColor(textPrimary)
         }
         statusSubtitle = TextView(themedCtx).apply {
-            textSize = 12.5f
-            setTextColor(textSecondary)
-            setPadding(0, dp(4), 0, dp(12))
-        }
-        accessBadge = TextView(themedCtx).apply {
             textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setTextColor(textSecondary)
+            setPadding(0, dp(2), 0, 0)
+        }
+        statusTexts.addView(statusTitle)
+        statusTexts.addView(statusSubtitle)
+        statusRow.addView(statusDot)
+        statusRow.addView(statusTexts)
+        statusGroup.addView(statusRow)
+
+        statusGroup.addView(createHairlineDivider())
+
+        val accessRow = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(13), dp(16), dp(13))
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
-        statusLayout.addView(statusTitle)
-        statusLayout.addView(statusSubtitle)
-        statusLayout.addView(accessBadge)
-        statusCard.addView(statusLayout)
-        root.addView(statusCard)
-
-        // 3. أزرار التحكم بالوجه
-        val actionsCard = createCard(cardColor)
-        val actionsLayout = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+        accessRowText = TextView(themedCtx).apply {
+            textSize = 15f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
+        val chevron = TextView(themedCtx).apply {
+            text = "‹"
+            textSize = 20f
+            setTextColor(textSecondary)
+        }
+        accessRow.addView(accessRowText)
+        accessRow.addView(chevron)
+        statusGroup.addView(accessRow)
+        root.addView(statusGroup)
 
-        enrollBtn = MaterialButton(themedCtx).apply {
-            text = "تسجيل الوجه (مسح 5 زوايا 3D)"
-            setBackgroundColor(accentColor)
-            setTextColor(Color.WHITE)
-            cornerRadius = dp(12)
+        // المجموعة 2: إدارة الوجه (صفوف نصية أنيقة مثل آبل)
+        val faceActionsGroup = createInsetGroup()
+        enrollRowText = TextView(themedCtx).apply {
+            text = "إعداد مظهر جديد للوجه"
+            textSize = 16f
+            setTextColor(appleBlue)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             setOnClickListener {
                 startActivity(Intent(this@MainActivity, SetupFaceIntroActivity::class.java))
             }
         }
+        faceActionsGroup.addView(enrollRowText)
+        faceActionsGroup.addView(createHairlineDivider())
 
-        systemAuthBtn = MaterialButton(themedCtx).apply {
-            text = "اختبار فتح القفل الآن"
-            setBackgroundColor(Color.parseColor("#262B38"))
-            setTextColor(textPrimary)
-            cornerRadius = dp(12)
-            setOnClickListener {
-                startActivity(Intent(this@MainActivity, FaceAuthActivity::class.java))
-            }
+        removeRowText = TextView(themedCtx).apply {
+            text = "إعادة تعيين بيانات الوجه"
+            textSize = 16f
+            setTextColor(appleRed)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
         }
+        faceActionsGroup.addView(removeRowText)
+        root.addView(faceActionsGroup)
 
-        removeBtn = MaterialButton(themedCtx).apply {
-            text = "حذف بيانات الوجه المسجلة"
-            setBackgroundColor(Color.parseColor("#3B1E26"))
-            setTextColor(Color.parseColor("#FF7A8A"))
-            cornerRadius = dp(12)
-        }
+        // المجموعة 3: الذكاء والانتباه وتجربة الاستخدام
+        root.addView(createSectionLabel("الانتباه وتجربة الاستخدام"))
+        val smartGroup = createInsetGroup()
 
-        actionsLayout.addView(enrollBtn, fullWidthParams(0))
-        actionsLayout.addView(systemAuthBtn, fullWidthParams(dp(8)))
-        actionsLayout.addView(removeBtn, fullWidthParams(dp(8)))
-        actionsCard.addView(actionsLayout)
-        root.addView(actionsCard)
-
-        // 4. خيارات تجربة الاستخدام الذكية
-        root.addView(sectionHeader("خيارات تجربة الاستخدام", textPrimary))
-        val togglesCard = createCard(cardColor)
-        val togglesLayout = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-        }
-
-        togglesLayout.addView(createSwitchRow(
-            title = "شرط فتح العينين",
-            subtitle = "يمنع فتح الجهاز أثناء النوم أو إغماض العينين",
+        smartGroup.addView(createAppleToggleRow(
+            title = "طلب الانتباه عند الفتح",
+            subtitle = "التحقق من فتح العينين والنظر إلى الشاشة",
             key = SmartFaceEngine.KEY_REQUIRE_EYES,
-            defaultVal = true,
-            textPrimary = textPrimary,
-            textSecondary = textSecondary
+            defaultVal = true
         ))
+        smartGroup.addView(createHairlineDivider())
 
-        togglesLayout.addView(createSwitchRow(
-            title = "التعلم التكيفي الذكي",
-            subtitle = "تحديث البصمة تلقائياً مع تغير الإضاءة وزوايا الاستخدام",
+        smartGroup.addView(createAppleToggleRow(
+            title = "التعلّم التكيفي المستمر",
+            subtitle = "تحديث البصمة تلقائياً مع تغيّر الإضاءة والمظهر",
             key = SmartFaceEngine.KEY_ADAPTIVE,
-            defaultVal = true,
-            textPrimary = textPrimary,
-            textSecondary = textSecondary
+            defaultVal = true
         ))
+        smartGroup.addView(createHairlineDivider())
 
-        togglesLayout.addView(createSwitchRow(
-            title = "إضاءة الشاشة في الظلام",
-            subtitle = "رفع سطوع الشاشة مؤقتاً أثناء التعرف على الوجه في الظلام",
+        smartGroup.addView(createAppleToggleRow(
+            title = "إضاءة ذكية في الظلام الدامس",
+            subtitle = "رفع السطوع تلقائياً فقط عندما تكون الغرفة مظلمة",
             key = SmartFaceEngine.KEY_NIGHT_LIGHT,
-            defaultVal = false,
-            textPrimary = textPrimary,
-            textSecondary = textSecondary
+            defaultVal = false
+        ))
+        smartGroup.addView(createHairlineDivider())
+
+        smartGroup.addView(createAppleToggleRow(
+            title = "إظهار حالة المسح على شاشة القفل",
+            subtitle = "عرض نص صغير أعلى الشاشة أثناء التعرّف",
+            key = SmartFaceEngine.KEY_SHOW_LOCK_STATUS,
+            defaultVal = false
+        ))
+        smartGroup.addView(createHairlineDivider())
+
+        smartGroup.addView(createAppleToggleRow(
+            title = "نغمة تأكيد خفيفة عند الفتح",
+            subtitle = "إصدار صوت نظام خفيف عند نجاح التعرّف",
+            key = SmartFaceEngine.KEY_UNLOCK_CHIME,
+            defaultVal = false
+        ))
+        root.addView(smartGroup)
+
+        root.addView(createSectionFootnote(
+            "الحماية ثلاثية الأبعاد وكشف التزييف العصبي مفعّلان تلقائياً في الخلفية لمنع الفتح عبر الصور أو الشاشات."
         ))
 
-        togglesLayout.addView(createSwitchRow(
-            title = "نبضة اهتزاز عند الفتح",
-            subtitle = "اهتزاز خفيف لتأكيد نجاح التعرف على الوجه",
-            key = SmartFaceEngine.KEY_VIBRATE,
-            defaultVal = true,
-            textPrimary = textPrimary,
-            textSecondary = textSecondary
-        ))
-
-        togglesCard.addView(togglesLayout)
-        root.addView(togglesCard)
-
-        // 5. إعدادات النظام وشاشة القفل الأصلية (SettingsFragment)
-        root.addView(sectionHeader("إعدادات شاشة القفل والنظام", textPrimary))
+        // المجموعة 4: إعدادات شاشة القفل والنظام
+        root.addView(createSectionLabel("إعدادات شاشة القفل"))
+        val systemGroup = createInsetGroup()
         val settingsContainer = FragmentContainerView(this).apply {
             id = View.generateViewId()
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
+            setPadding(dp(4), dp(4), dp(4), dp(4))
         }
-        root.addView(settingsContainer)
+        systemGroup.addView(settingsContainer)
+        root.addView(systemGroup)
 
         scroll.addView(root)
         setContentView(scroll)
@@ -233,40 +278,61 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         }
     }
 
-    private fun createCard(bgColor: Int): MaterialCardView {
-        return MaterialCardView(themedCtx).apply {
-            setCardBackgroundColor(bgColor)
-            radius = dp(16).toFloat()
-            cardElevation = dp(2).toFloat()
+    private fun createInsetGroup(): LinearLayout {
+        val bg = GradientDrawable().apply {
+            setColor(cardBgColor)
+            cornerRadius = dp(13).toFloat()
+            setStroke(1, dividerColor)
+        }
+        return LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = bg
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(14) }
+            ).apply { bottomMargin = dp(18) }
         }
     }
 
-    private fun sectionHeader(title: String, color: Int): TextView {
+    private fun createHairlineDivider(): View {
+        return View(themedCtx).apply {
+            setBackgroundColor(dividerColor)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                1
+            ).apply { marginStart = dp(16) }
+        }
+    }
+
+    private fun createSectionLabel(text: String): TextView {
         return TextView(themedCtx).apply {
-            text = title
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(color)
-            setPadding(dp(4), dp(6), dp(4), dp(10))
+            this.text = text
+            textSize = 13f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(textSecondary)
+            setPadding(dp(14), dp(2), dp(14), dp(8))
         }
     }
 
-    private fun createSwitchRow(
+    private fun createSectionFootnote(text: String): TextView {
+        return TextView(themedCtx).apply {
+            this.text = text
+            textSize = 12f
+            setTextColor(textSecondary)
+            setPadding(dp(14), 0, dp(14), dp(18))
+        }
+    }
+
+    private fun createAppleToggleRow(
         title: String,
         subtitle: String,
         key: String,
-        defaultVal: Boolean,
-        textPrimary: Int,
-        textSecondary: Int
+        defaultVal: Boolean
     ): LinearLayout {
         val row = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
+            setPadding(dp(16), dp(12), dp(16), dp(12))
         }
 
         val textCol = LinearLayout(themedCtx).apply {
@@ -277,19 +343,26 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         }
         textCol.addView(TextView(themedCtx).apply {
             text = title
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
+            textSize = 15.5f
             setTextColor(textPrimary)
         })
         textCol.addView(TextView(themedCtx).apply {
             text = subtitle
-            textSize = 12f
+            textSize = 12.5f
             setTextColor(textSecondary)
             setPadding(0, dp(2), 0, 0)
         })
 
+        val trackStates = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(appleGreen, if (isDarkTheme) Color.parseColor("#39393D") else Color.parseColor("#E9E9EA"))
+        )
+        val thumbStates = ColorStateList.valueOf(Color.WHITE)
+
         val switchView = SwitchMaterial(themedCtx).apply {
             isChecked = prefs.getBoolean(key, defaultVal)
+            trackTintList = trackStates
+            thumbTintList = thumbStates
             setOnCheckedChangeListener { _, isChecked ->
                 prefs.edit().putBoolean(key, isChecked).apply()
             }
@@ -298,13 +371,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         row.addView(textCol)
         row.addView(switchView)
         return row
-    }
-
-    private fun fullWidthParams(topMargin: Int): LinearLayout.LayoutParams {
-        return LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(48)
-        ).apply { this.topMargin = topMargin }
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -332,32 +398,35 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         val faceId = SharedUtil(this).getIntValueByKey(AppConstants.SHARED_KEY_FACE_ID)
         val isEnrolled = faceId > -1
 
+        val dotDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (isEnrolled) appleGreen else textSecondary)
+        }
+        statusDot.background = dotDrawable
+
         if (isEnrolled) {
-            statusTitle.text = "حالة الوجه: مسجّل ومُشفّر ✓"
-            statusSubtitle.text = "محمي بتشفير AndroidKeyStore AES-GCM وجاهز لفتح القفل"
-            enrollBtn.text = "إعادة تسجيل الوجه (مسح 5 زوايا 3D)"
-            enrollBtn.isEnabled = true
-            systemAuthBtn.isEnabled = true
-            removeBtn.isEnabled = true
-            removeBtn.setOnClickListener { removeFace(faceId) }
+            statusTitle.text = "التعرّف على الوجه مُفعّل"
+            statusSubtitle.text = "البصمة ثلاثية الأبعاد مشفّرة ومحفوظة بأمان"
+            enrollRowText.text = "إعادة إعداد مظهر الوجه"
+            removeRowText.alpha = 1.0f
+            removeRowText.isEnabled = true
+            removeRowText.setOnClickListener { removeFace(faceId) }
         } else {
-            statusTitle.text = "حالة الوجه: غير مسجّل"
-            statusSubtitle.text = "اضغط على زر التسجيل بالأسفل لمسح وجهك من 5 زوايا"
-            enrollBtn.text = "تسجيل الوجه الآن (مسح 5 زوايا 3D)"
-            enrollBtn.isEnabled = true
-            systemAuthBtn.isEnabled = false
-            removeBtn.isEnabled = false
+            statusTitle.text = "لم يتم إعداد الوجه بعد"
+            statusSubtitle.text = "ابدأ المسح من 5 زوايا لتفعيل فتح القفل بالوجه"
+            enrollRowText.text = "إعداد التعرّف على الوجه"
+            removeRowText.alpha = 0.4f
+            removeRowText.isEnabled = false
+            removeRowText.setOnClickListener(null)
         }
 
         val accessOk = isAccessServiceEnabled(this, LockscreenFaceAuthService::class.java)
         if (accessOk) {
-            accessBadge.text = "● خدمة شاشة القفل مفعّلة وتعمل"
-            accessBadge.setTextColor(Color.parseColor("#2ECC71"))
-            accessBadge.setBackgroundColor(Color.parseColor("#163326"))
+            accessRowText.text = "خدمة شاشة القفل نشطة"
+            accessRowText.setTextColor(appleGreen)
         } else {
-            accessBadge.text = "⚠ خدمة شاشة القفل غير مفعّلة (اضغط هنا للتفعيل)"
-            accessBadge.setTextColor(Color.parseColor("#FFB74D"))
-            accessBadge.setBackgroundColor(Color.parseColor("#382A16"))
+            accessRowText.text = "تفعيل خدمة شاشة القفل (مطلوب)"
+            accessRowText.setTextColor(appleRed)
         }
     }
 
@@ -383,7 +452,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
     override fun onRemove() {
         runOnUiThread {
-            Toast.makeText(this, "تم حذف بيانات الوجه بنجاح", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "تمت إعادة تعيين بيانات الوجه", Toast.LENGTH_SHORT).show()
             updateDashboardState()
             releaseRemoveFaceController()
         }
@@ -391,7 +460,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
     override fun onError(errId: Int, message: String) {
         runOnUiThread {
-            Toast.makeText(this, "فشل الحذف: $message", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "تعذّر الحذف: $message", Toast.LENGTH_LONG).show()
             releaseRemoveFaceController()
         }
     }
