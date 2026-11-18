@@ -43,7 +43,6 @@ public class FaceIdOverlay extends View {
 
     private static FaceIdOverlay instance;
     private static View fillLightView;
-    private static WindowManager.LayoutParams fillLightParams;
     private static ValueAnimator fillLightAnimator;
     private static boolean hardwareBrightnessBoosted = false;
     private static float savedBrightnessBeforeBoost = 0.4f;
@@ -162,10 +161,11 @@ public class FaceIdOverlay extends View {
             FaceIdOverlay view = new FaceIdOverlay(appCtx);
             int sizePx = dp(appCtx, 68);
 
+            // استخدام أعلى طبقة للكبسولة (2015 TYPE_SECURE_SYSTEM_OVERLAY) لتبقى دائماً فوق طبقة الإضاءة البيضاء
             int[] windowTypes = new int[]{
-                    2024, // TYPE_NAVIGATION_BAR_PANEL
-                    2015, // TYPE_SECURE_SYSTEM_OVERLAY
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    2015, // TYPE_SECURE_SYSTEM_OVERLAY (Layer 29)
+                    2024, // TYPE_NAVIGATION_BAR_PANEL (Layer 24)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // (Layer 21)
             };
 
             boolean added = false;
@@ -302,10 +302,11 @@ public class FaceIdOverlay extends View {
             lightPanel.setBackgroundColor(Color.WHITE);
             lightPanel.setAlpha(0f);
 
+            // استخدام طبقات أدنى من كبسولة Face ID (2015) حتى تظل الكبسولة ظاهرة فوق الإضاءة البيضاء دائماً
             int[] windowTypes = new int[]{
-                    2015, // TYPE_SECURE_SYSTEM_OVERLAY (تحت الكبسولة مباشرة)
-                    2024,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, // Layer 21 (أدنى من 2015 و 2024)
+                    2024, // TYPE_NAVIGATION_BAR_PANEL (Layer 24 - أدنى من 2015)
+                    2006  // TYPE_SYSTEM_OVERLAY (Layer 17)
             };
 
             for (int type : windowTypes) {
@@ -326,19 +327,12 @@ public class FaceIdOverlay extends View {
 
                     wm.addView(lightPanel, params);
                     fillLightView = lightPanel;
-                    fillLightParams = params;
 
-                    // ضمان بقاء كبسولة Face ID فوق الطبقة البيضاء دائماً
-                    if (instance != null && instance.isAttachedToWindow()) {
-                        wm.removeViewImmediate(instance);
-                        wm.addView(instance, instance.layoutParams);
-                    }
-
-                    // تدرج سريع وسلس خلال 420ms من السطوع الحالي حتى 100% سطوع كامل
+                    // تدرج سريع وسلس خلال 400ms من السطوع الحالي حتى 100% سطوع كامل
                     if (fillLightAnimator != null) fillLightAnimator.cancel();
                     final float startB = savedBrightnessBeforeBoost;
                     fillLightAnimator = ValueAnimator.ofFloat(0f, 1f);
-                    fillLightAnimator.setDuration(420L);
+                    fillLightAnimator.setDuration(400L);
                     fillLightAnimator.setInterpolator(new DecelerateInterpolator());
                     fillLightAnimator.addUpdateListener(anim -> {
                         float p = (float) anim.getAnimatedValue();
@@ -346,7 +340,7 @@ public class FaceIdOverlay extends View {
                         setHardwareDisplayBrightness(appCtx, targetBrightness);
 
                         if (fillLightView != null && fillLightView.isAttachedToWindow()) {
-                            fillLightView.setAlpha(p * 0.98f);
+                            fillLightView.setAlpha(p * 0.94f);
                         }
                     });
                     fillLightAnimator.start();
@@ -379,7 +373,6 @@ public class FaceIdOverlay extends View {
         View panel = fillLightView;
         Context ctx = panel.getContext();
         fillLightView = null;
-        fillLightParams = null;
 
         restoreDisplayBrightness(ctx);
 
@@ -762,8 +755,8 @@ public class FaceIdOverlay extends View {
             borderPaint.setColor(Color.parseColor("#CCFF6B35"));
             borderPaint.setStrokeWidth(dp(getContext(), 1.8f));
         } else {
-            borderPaint.setColor(Color.parseColor("#33FFFFFF"));
-            borderPaint.setStrokeWidth(dp(getContext(), 1.2f));
+            borderPaint.setColor(Color.parseColor("#4DFFFFFF"));
+            borderPaint.setStrokeWidth(dp(getContext(), 1.3f));
         }
 
         float cornerRadius = dp(getContext(), 20) + (morphProgress * (w / 2f));
@@ -891,4 +884,4 @@ public class FaceIdOverlay extends View {
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-            }
+                }
