@@ -241,14 +241,69 @@ public class Module implements IXposedHookLoadPackage {
         }
     }
 
+    private int failedScanAttempts = 0;
+    private boolean scanWasActive = false;
+    private boolean unlockedInCurrentCycle = false;
+
+    private static final long FIRST_SCAN_WINDOW_MS = 2600L;
+    private static final long RESCAN_RESET_GAP_MS = 180L;
+    private final android.os.Handler scanHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private Runnable secondScanRunnable;
+
+    private void cancelPendingSecondScan() {
+        if (secondScanRunnable != null) {
+            scanHandler.removeCallbacks(secondScanRunnable);
+            secondScanRunnable = null;
+        }
+    }
+
+    private void scheduleSecondRealScan(Context context) {
+        cancelPendingSecondScan();
+        secondScanRunnable = () -> {
+            if (!scanWasActive || unlockedInCurrentCycle || context == null) return;
+            try {
+                context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                        .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
+                FaceIdOverlay.triggerRetryPulse();
+
+                scanHandler.postDelayed(() -> {
+                    if (scanWasActive && !unlockedInCurrentCycle) {
+                        try {
+                            context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                                    .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }, RESCAN_RESET_GAP_MS);
+            } catch (Throwable ignored) {
+            }
+        };
+        scanHandler.postDelayed(secondScanRunnable, FIRST_SCAN_WINDOW_MS);
+    }
+
     private void hookEarlyUnlock(Context context, boolean newAwakeKeyguard) throws Throwable {
         if (newAwakeKeyguard) {
+            if (failedScanAttempts >= 3) {
+                return;
+            }
+            scanWasActive = true;
+            unlockedInCurrentCycle = false;
             FaceIdOverlay.showScanning(context);
+            context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                    .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
+
+            scheduleSecondRealScan(context);
         } else {
+            cancelPendingSecondScan();
+            if (scanWasActive && !unlockedInCurrentCycle) {
+                failedScanAttempts++;
+            }
+            scanWasActive = false;
             FaceIdOverlay.hide();
             setLockscreenUnlocked(false);
+            context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                    .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
         }
-        context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK).putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, newAwakeKeyguard));
     }
 
     private <T extends AccessibleObject> T asAccessible(T a) {
@@ -290,14 +345,75 @@ public class Module implements IXposedHookLoadPackage {
 
         UnlockMethod method = hookStatusBarBiometricUnlock(classLoader, statusBar, statusBarClass);
 
+        // استقبال نتيجة فحص الانعكاس والحيوية وتصفير المحاولات عند فتح القفل يدوياً
+        android.content.BroadcastReceiver livenessReceiver = new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent resIntent) {
+                String action = resIntent.getAction();
+                if (Intent.ACTION_USER_PRESENT.equals(action)) {
+                    failedScanAttempts = 0;
+                    unlockedInCurrentCycle = false;
+                    scanWasActive = false;
+                    cancelPendingSecondScan();
+                    return;
+                }
+
+                if (LivenessVerifierService.ACTION_LIVENESS_RESULT.equals(action)) {
+                    boolean passed = resIntent.getBooleanExtra(LivenessVerifierService.EXTRA_PASSED, false);
+                    String reason = resIntent.getStringExtra(LivenessVerifierService.EXTRA_REASON);
+
+                    if ("NO_CAMERA_PERMISSION".equals(reason)) {
+                        android.widget.Toast.makeText(context, "يرجى منح إذن الكاميرا لتطبيق UniversalAuth", android.widget.Toast.LENGTH_LONG).show();
+                    }
+
+                    if (passed && !isUserInLockdown(kum)) {
+                        unlockedInCurrentCycle = true;
+                        failedScanAttempts = 0;
+                        FaceIdOverlay.showSuccess(context);
+                        setLockscreenUnlocked(true);
+                        try {
+                            if (isBouncerShowing()) {
+                                method.unlock(new Intent());
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    } else {
+                        failedScanAttempts++;
+                        FaceIdOverlay.showFailure(context);
+                    }
+                }
+            }
+        };
+
+        android.content.IntentFilter filter = new android.content.IntentFilter();
+        filter.addAction(LivenessVerifierService.ACTION_LIVENESS_RESULT);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(livenessReceiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            context.registerReceiver(livenessReceiver, filter);
+        }
+
+        // عند نجاح FaceGuard، يتم تحرير الكاميرا وتشغيل مرحلة التأكيد النهائي قبل الفتح
         UnlockReceiver.INSTANCE.setup(context, statusBar, intent -> {
             try {
-                if (!isUserInLockdown(kum)) {
-                    FaceIdOverlay.showSuccess(context);
-                    setLockscreenUnlocked(true);
-                    if (isBouncerShowing()) {
-                        method.unlock(intent);
-                    }
+                if (isUserInLockdown(kum) || failedScanAttempts >= 3) {
+                    cancelPendingSecondScan();
+                    FaceIdOverlay.showFailure(context);
+                    return Unit.INSTANCE;
+                }
+
+                cancelPendingSecondScan();
+
+                context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
+                        .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
+
+                Intent verifyIntent = new Intent(LivenessVerifierService.ACTION_VERIFY_LIVENESS);
+                verifyIntent.setClassName("ax.nd.universalauth.xposed", LivenessVerifierService.class.getName());
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(verifyIntent);
+                } else {
+                    context.startService(verifyIntent);
                 }
             } catch (Throwable throwable) {
                 throw new RuntimeException(throwable);
@@ -336,4 +452,4 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
     }
-}
+                    }
