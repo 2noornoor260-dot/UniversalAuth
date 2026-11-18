@@ -11,6 +11,7 @@ import android.graphics.Typeface
 import android.hardware.Camera
 import android.os.Bundle
 import android.provider.Settings
+import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -42,6 +43,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     private var removeFaceController: RemoveFaceController? = null
     private var requestUnlockPermsLauncher: ActivityResultLauncher<String>? = null
     private lateinit var prefs: SharedPreferences
+    private lateinit var themedCtx: Context
 
     private lateinit var statusTitle: TextView
     private lateinit var statusSubtitle: TextView
@@ -55,7 +57,13 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     private var isTestingLive = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(com.google.android.material.R.style.Theme_MaterialComponents_DayNight_NoActionBar)
         super.onCreate(savedInstanceState)
+
+        themedCtx = ContextThemeWrapper(
+            this,
+            com.google.android.material.R.style.Theme_MaterialComponents_DayNight_NoActionBar
+        )
         prefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         requestUnlockPermsLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
@@ -70,24 +78,24 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         val textPrimary = Color.parseColor("#F4F6FA")
         val textSecondary = Color.parseColor("#9BA3B4")
 
-        val scroll = NestedScrollView(this).apply {
+        val scroll = NestedScrollView(themedCtx).apply {
             setBackgroundColor(bgColor)
             isFillViewport = true
         }
 
-        val root = LinearLayout(this).apply {
+        val root = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(24), dp(18), dp(36))
         }
 
         // 1. العنوان العلوي
-        root.addView(TextView(this).apply {
+        root.addView(TextView(themedCtx).apply {
             text = "SmartFace AI Unlock"
             textSize = 26f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(textPrimary)
         })
-        root.addView(TextView(this).apply {
+        root.addView(TextView(themedCtx).apply {
             text = "محرك التعرف ثلاثي الأبعاد • ML Kit + 3D Mesh + InsightFace"
             textSize = 13f
             setTextColor(accentColor)
@@ -96,22 +104,22 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
         // 2. بطاقة حالة النظام والوصول
         val statusCard = createCard(cardColor)
-        val statusLayout = LinearLayout(this).apply {
+        val statusLayout = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
 
-        statusTitle = TextView(this).apply {
+        statusTitle = TextView(themedCtx).apply {
             textSize = 18f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(textPrimary)
         }
-        statusSubtitle = TextView(this).apply {
+        statusSubtitle = TextView(themedCtx).apply {
             textSize = 13f
             setTextColor(textSecondary)
             setPadding(0, dp(4), 0, dp(12))
         }
-        accessBadge = TextView(this).apply {
+        accessBadge = TextView(themedCtx).apply {
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(12), dp(8), dp(12), dp(8))
@@ -127,12 +135,12 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
         // 3. أزرار الإجراءات الرئيسية
         val actionsCard = createCard(cardColor)
-        val actionsLayout = LinearLayout(this).apply {
+        val actionsLayout = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
-        enrollBtn = MaterialButton(this).apply {
+        enrollBtn = MaterialButton(themedCtx).apply {
             text = "تسجيل الوجه (مسح 5 زوايا 3D)"
             setBackgroundColor(accentColor)
             setTextColor(Color.WHITE)
@@ -142,7 +150,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             }
         }
 
-        liveTestBtn = MaterialButton(this).apply {
+        liveTestBtn = MaterialButton(themedCtx).apply {
             text = "اختبار الذكاء الاصطناعي الحي (Live AI Test)"
             setBackgroundColor(Color.parseColor("#243B55"))
             setTextColor(Color.parseColor("#7FB3FF"))
@@ -150,7 +158,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             setOnClickListener { openLiveCameraTestDialog() }
         }
 
-        systemAuthBtn = MaterialButton(this).apply {
+        systemAuthBtn = MaterialButton(themedCtx).apply {
             text = "تجربة قفل النظام"
             setBackgroundColor(Color.parseColor("#262B38"))
             setTextColor(textPrimary)
@@ -160,7 +168,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             }
         }
 
-        removeBtn = MaterialButton(this).apply {
+        removeBtn = MaterialButton(themedCtx).apply {
             text = "حذف بيانات الوجه المسجلة"
             setBackgroundColor(Color.parseColor("#3B1E26"))
             setTextColor(Color.parseColor("#FF7A8A"))
@@ -177,7 +185,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         // 4. قسم مفاتيح التحكم الفورية (Switches)
         root.addView(sectionHeader("التحكم في الميزات والأمان", textPrimary))
         val togglesCard = createCard(cardColor)
-        val togglesLayout = LinearLayout(this).apply {
+        val togglesLayout = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
@@ -242,7 +250,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         // 5. قسم ضبط الحساسية والدقة (Sliders)
         root.addView(sectionHeader("ضبط الحساسية والسرعة", textPrimary))
         val slidersCard = createCard(cardColor)
-        val slidersLayout = LinearLayout(this).apply {
+        val slidersLayout = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
@@ -302,17 +310,17 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             return
         }
 
-        val container = LinearLayout(this).apply {
+        val container = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
-        val surfaceView = SurfaceView(this).apply {
+        val surfaceView = SurfaceView(themedCtx).apply {
             layoutParams = LinearLayout.LayoutParams(dp(240), dp(300))
         }
 
-        val infoText = TextView(this).apply {
+        val infoText = TextView(themedCtx).apply {
             text = "جاري تشغيل الكاميرا والذكاء الاصطناعي..."
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
@@ -320,7 +328,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             setPadding(0, dp(14), 0, dp(4))
         }
 
-        val metricsText = TextView(this).apply {
+        val metricsText = TextView(themedCtx).apply {
             text = "التطابق: --% | الحقيقية: --% | السرعة: -- ms"
             textSize = 13f
             gravity = Gravity.CENTER
@@ -396,7 +404,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     }
 
     private fun createCard(bgColor: Int): MaterialCardView {
-        return MaterialCardView(this).apply {
+        return MaterialCardView(themedCtx).apply {
             setCardBackgroundColor(bgColor)
             radius = dp(16).toFloat()
             cardElevation = dp(2).toFloat()
@@ -408,7 +416,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     }
 
     private fun sectionHeader(title: String, color: Int): TextView {
-        return TextView(this).apply {
+        return TextView(themedCtx).apply {
             text = title
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
@@ -425,32 +433,32 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         textPrimary: Int,
         textSecondary: Int
     ): LinearLayout {
-        val row = LinearLayout(this).apply {
+        val row = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(10), 0, dp(10))
         }
 
-        val textCol = LinearLayout(this).apply {
+        val textCol = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginEnd = dp(12)
             }
         }
-        textCol.addView(TextView(this).apply {
+        textCol.addView(TextView(themedCtx).apply {
             text = title
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(textPrimary)
         })
-        textCol.addView(TextView(this).apply {
+        textCol.addView(TextView(themedCtx).apply {
             text = subtitle
             textSize = 12f
             setTextColor(textSecondary)
             setPadding(0, dp(2), 0, 0)
         })
 
-        val switchView = SwitchMaterial(this).apply {
+        val switchView = SwitchMaterial(themedCtx).apply {
             isChecked = prefs.getBoolean(key, defaultVal)
             setOnCheckedChangeListener { _, isChecked ->
                 prefs.edit().putBoolean(key, isChecked).apply()
@@ -475,18 +483,18 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         textSecondary: Int,
         accentColor: Int
     ): LinearLayout {
-        val col = LinearLayout(this).apply {
+        val col = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, dp(10))
         }
 
         val currentVal = prefs.getFloat(key, defaultVal).coerceIn(minVal, maxVal)
-        val headerRow = LinearLayout(this).apply {
+        val headerRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val titleView = TextView(this).apply {
+        val titleView = TextView(themedCtx).apply {
             text = title
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
@@ -494,7 +502,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val valueBadge = TextView(this).apply {
+        val valueBadge = TextView(themedCtx).apply {
             text = "${(currentVal * scaleMultiplier).toInt()}$unitSuffix"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
@@ -504,14 +512,14 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         headerRow.addView(titleView)
         headerRow.addView(valueBadge)
 
-        val subView = TextView(this).apply {
+        val subView = TextView(themedCtx).apply {
             text = subtitle
             textSize = 12f
             setTextColor(textSecondary)
             setPadding(0, dp(2), 0, dp(4))
         }
 
-        val slider = Slider(this).apply {
+        val slider = Slider(themedCtx).apply {
             valueFrom = minVal
             valueTo = maxVal
             value = currentVal
