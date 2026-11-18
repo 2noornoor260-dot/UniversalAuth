@@ -9,6 +9,7 @@ import android.app.Application;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
+import android.os.SystemClock;
 
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Field;
@@ -41,6 +42,7 @@ public class Module implements IXposedHookLoadPackage {
     private static final String KEYGUARD_UPDATE_MONITOR_LAST_MODE = "ax.nd.universalauth.last-mode";
 
     private static final int SHADE_LOCKED = 2;
+    private static final long INACTIVITY_PIN_TIMEOUT_MS = 45L * 60L * 1000L; // 45 دقيقة
 
     private Method isUserInLockdownMethod;
 
@@ -236,12 +238,34 @@ public class Module implements IXposedHookLoadPackage {
     private boolean unlockedInCurrentCycle = false;
     private int scanGeneration = 0;
 
+    private long lastSuccessfulUnlockElapsedMs = 0L;
+    private boolean pinRequiredByInactivity = false;
+
     private static final long FIRST_SCAN_WINDOW_MS = 2200L;
     private static final long RESCAN_RESET_GAP_MS = 600L;
-    private static final float CAMERA_DARK_LUMA_THRESHOLD = 46.0f;
 
     private android.os.Handler scanHandler;
     private Runnable secondScanRunnable;
+
+    private boolean isTimedOutRequirePin() {
+        if (pinRequiredByInactivity) {
+            return true;
+        }
+        if (lastSuccessfulUnlockElapsedMs > 0L) {
+            long elapsedSinceUnlock = SystemClock.elapsedRealtime() - lastSuccessfulUnlockElapsedMs;
+            if (elapsedSinceUnlock >= INACTIVITY_PIN_TIMEOUT_MS) {
+                pinRequiredByInactivity = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void recordSuccessfulUnlock() {
+        lastSuccessfulUnlockElapsedMs = SystemClock.elapsedRealtime();
+        pinRequiredByInactivity = false;
+        failedScanAttempts = 0;
+    }
 
     private android.os.Handler getScanHandler() {
         if (scanHandler == null) {
@@ -275,6 +299,7 @@ public class Module implements IXposedHookLoadPackage {
 
         final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean(false);
         final java.util.concurrent.atomic.AtomicInteger frameCounter = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger lastIso = new java.util.concurrent.atomic.AtomicInteger(100);
         final android.os.HandlerThread camThread = new android.os.HandlerThread("UA_DarkProbe");
         camThread.start();
         final android.os.Handler camHandler = new android.os.Handler(camThread.getLooper());
@@ -303,7 +328,7 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
 
-        // مهلة أمان 350ms لضمان عدم تأخر بدء المسح إطلاقاً
+        // مهلة أمان 850ms تسمح بتشغيل الكاميرا وقراءة التعريض الحقيقي دون فشل مبكر
         camHandler.postDelayed(() -> {
             if (finished.compareAndSet(false, true)) {
                 cleanupAndFinish.run();
@@ -313,7 +338,7 @@ public class Module implements IXposedHookLoadPackage {
                     }
                 });
             }
-        }, 350L);
+        }, 850L);
 
         camHandler.post(() -> {
             try {
@@ -362,7 +387,6 @@ public class Module implements IXposedHookLoadPackage {
                         img = r.acquireLatestImage();
                         if (img == null) return;
 
-                        // تخطي الإطار الأول حتى يستقر التعريض التلقائي (AE) لمستشعر الكاميرا
                         if (frameCounter.incrementAndGet() < 2) {
                             img.close();
                             return;
@@ -399,7 +423,10 @@ public class Module implements IXposedHookLoadPackage {
                         }
                     }
 
-                    final boolean isDark = meanLuma < CAMERA_DARK_LUMA_THRESHOLD;
+                    int iso = lastIso.get();
+                    // كشف الظلام الحقيقي عبر دمج سطوع الصورة مع حساسية المستشعر (ISO)
+                    final boolean isDark = (meanLuma < 52.0f) || (iso >= 750 && meanLuma < 88.0f);
+
                     if (finished.compareAndSet(false, true)) {
                         cleanupAndFinish.run();
                         mainH.post(() -> {
@@ -432,7 +459,23 @@ public class Module implements IXposedHookLoadPackage {
                                         public void onConfigured(android.hardware.camera2.CameraCaptureSession session) {
                                             if (finished.get()) return;
                                             try {
-                                                session.setRepeatingRequest(req.build(), null, camHandler);
+                                                session.setRepeatingRequest(req.build(),
+                                                        new android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                                                            @Override
+                                                            public void onCaptureCompleted(
+                                                                    android.hardware.camera2.CameraCaptureSession s,
+                                                                    android.hardware.camera2.CaptureRequest request,
+                                                                    android.hardware.camera2.TotalCaptureResult result) {
+                                                                try {
+                                                                    Integer isoVal = result.get(
+                                                                            android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY);
+                                                                    if (isoVal != null) {
+                                                                        lastIso.set(isoVal);
+                                                                    }
+                                                                } catch (Throwable ignored) {
+                                                                }
+                                                            }
+                                                        }, camHandler);
                                             } catch (Throwable ignored) {
                                             }
                                         }
@@ -475,19 +518,17 @@ public class Module implements IXposedHookLoadPackage {
 
         secondScanRunnable = () -> {
             if (!scanWasActive || unlockedInCurrentCycle || context == null || scanGeneration != generation) return;
+            if (isTimedOutRequirePin()) return;
             try {
-                // 1. إيقاف الجلسة الأولى في FaceGuard لتحرير الكاميرا بالكامل
                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false));
 
-                // 2. تشغيل الأنيميشن الانتقالي الواضح بين المحاولتين
                 FaceIdOverlay.triggerRetryTransition();
 
-                // 3. الانتظار 600ms لإغلاق الكاميرا تماماً ثم بدء جلسة مسح ثانية حقيقية
                 android.os.Handler innerH = getScanHandler();
                 if (innerH != null) {
                     innerH.postDelayed(() -> {
-                        if (scanWasActive && !unlockedInCurrentCycle && scanGeneration == generation) {
+                        if (scanWasActive && !unlockedInCurrentCycle && scanGeneration == generation && !isTimedOutRequirePin()) {
                             try {
                                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
                                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
@@ -504,6 +545,11 @@ public class Module implements IXposedHookLoadPackage {
 
     private void hookEarlyUnlock(Context context, boolean newAwakeKeyguard) throws Throwable {
         if (newAwakeKeyguard) {
+            if (isTimedOutRequirePin()) {
+                setLockscreenUnlocked(false);
+                FaceIdOverlay.showPinRequired(context);
+                return;
+            }
             if (failedScanAttempts >= 3) {
                 return;
             }
@@ -511,11 +557,17 @@ public class Module implements IXposedHookLoadPackage {
             unlockedInCurrentCycle = false;
             final int currentGen = ++scanGeneration;
 
-            // فحص الإضاءة عبر الكاميرا الأمامية أولاً قبل تشغيل FaceGuard
+            // إظهار كبسولة Face ID فوراً بدون أي تأخير
+            FaceIdOverlay.showScanning(context);
+
+            // فحص الظلام عبر الكاميرا الأمامية قبل إطلاق FaceGuard
             checkDarknessViaFrontCamera(context, currentGen, isDark -> {
                 if (!scanWasActive || unlockedInCurrentCycle || scanGeneration != currentGen) return;
+                if (isTimedOutRequirePin()) return;
 
-                FaceIdOverlay.showScanning(context, isDark);
+                if (isDark) {
+                    FaceIdOverlay.enableFillLight(context);
+                }
                 context.sendBroadcast(new Intent(XposedConstants.ACTION_EARLY_UNLOCK)
                         .putExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, true));
 
@@ -554,6 +606,10 @@ public class Module implements IXposedHookLoadPackage {
         cachedStatusBar = statusBar;
         cachedStatusBarClass = statusBarClass;
 
+        if (lastSuccessfulUnlockElapsedMs == 0L) {
+            lastSuccessfulUnlockElapsedMs = SystemClock.elapsedRealtime();
+        }
+
         Class<?> systemUiClass;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             systemUiClass = classLoader.loadClass(CENTRAL_SURFACES_IMPL_CLASS);
@@ -579,7 +635,8 @@ public class Module implements IXposedHookLoadPackage {
             public void onReceive(Context ctx, Intent resIntent) {
                 String action = resIntent.getAction();
                 if (Intent.ACTION_USER_PRESENT.equals(action)) {
-                    failedScanAttempts = 0;
+                    // فتح الجهاز بنجاح (سواء برمز PIN أو بسحب الشاشة بعد الوجه) يعيد ضبط مؤقت 45 دقيقة
+                    recordSuccessfulUnlock();
                     unlockedInCurrentCycle = false;
                     scanWasActive = false;
                     cancelPendingSecondScan();
@@ -595,9 +652,9 @@ public class Module implements IXposedHookLoadPackage {
                     }
 
                     try {
-                        if (passed && !isUserInLockdown(kum)) {
+                        if (passed && !isUserInLockdown(kum) && !isTimedOutRequirePin()) {
                             unlockedInCurrentCycle = true;
-                            failedScanAttempts = 0;
+                            recordSuccessfulUnlock();
                             FaceIdOverlay.showSuccess(context);
                             setLockscreenUnlocked(true);
                             if (isBouncerShowing()) {
@@ -624,9 +681,14 @@ public class Module implements IXposedHookLoadPackage {
 
         UnlockReceiver.INSTANCE.setup(context, statusBar, intent -> {
             try {
-                if (isUserInLockdown(kum) || failedScanAttempts >= 3) {
+                if (isUserInLockdown(kum) || isTimedOutRequirePin() || failedScanAttempts >= 3) {
                     cancelPendingSecondScan();
-                    FaceIdOverlay.showFailure(context);
+                    setLockscreenUnlocked(false);
+                    if (isTimedOutRequirePin()) {
+                        FaceIdOverlay.showPinRequired(context);
+                    } else {
+                        FaceIdOverlay.showFailure(context);
+                    }
                     return Unit.INSTANCE;
                 }
 
@@ -679,4 +741,4 @@ public class Module implements IXposedHookLoadPackage {
             }
         };
     }
-                    }
+                                                     }
