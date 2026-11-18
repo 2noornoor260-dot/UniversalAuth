@@ -10,8 +10,11 @@ import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import android.util.TypedValue
 import android.view.Display
@@ -23,6 +26,7 @@ import android.widget.TextView
 import androidx.core.content.getSystemService
 import ax.nd.faceunlock.FaceApplication
 import ax.nd.faceunlock.LibManager
+import ax.nd.faceunlock.backend.SmartFaceEngine
 import ax.nd.faceunlock.pref.Prefs
 import ax.nd.faceunlock.util.Util
 import ax.nd.faceunlock.util.dpToPx
@@ -49,6 +53,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     private var active: Boolean = false
+    private var viewAdded: Boolean = false
     private var lockStateReceiver: BroadcastReceiver? = null
     private var unlockReceiver: BroadcastReceiver? = null
     private var controller: FaceAuthServiceController? = null
@@ -68,12 +73,10 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     override fun onCreate() {
         super.onCreate()
 
-        // Coroutine env
         serviceJob = Job()
         serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
 
         prefs = FaceApplication.getApp().prefs
-
         controller = FaceAuthServiceController(this, prefs, this)
 
         windowManager = getSystemService()
@@ -81,15 +84,16 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         displayManager = getSystemService()
         handler = Handler(Looper.getMainLooper())
 
-        textView = TextView(this)
-        textView?.setTextColor(getColor(android.R.color.white))
-        textView?.setShadowLayer(10f, 0f, 0f, Color.BLACK)
-        textView?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-        textView?.setPadding(0, 16.dpToPx.toInt(), 0, 0)
-        textView?.textAlignment = TextView.TEXT_ALIGNMENT_CENTER
+        textView = TextView(this).apply {
+            setTextColor(getColor(android.R.color.white))
+            setShadowLayer(10f, 0f, 0f, Color.BLACK)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(0, 16.dpToPx.toInt(), 0, 0)
+            textAlignment = TextView.TEXT_ALIGNMENT_CENTER
+        }
 
         booted = !prefs.requirePinOnBoot.get()
-        if(booted) {
+        if (booted) {
             reconfigureUnlockHook()
         }
         setupUnlockReceiver()
@@ -107,7 +111,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
         unlockReceiver = object : BroadcastReceiver() {
             override fun onReceive(p0: Context?, p1: Intent?) {
-                if(!booted) {
+                if (!booted) {
                     booted = true
                     reconfigureUnlockHook()
                 }
@@ -128,7 +132,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         serviceScope.launch {
             prefs.earlyUnlockHook.asFlow().collect { earlyUnlock ->
                 unregisterLockStateReceiver()
-                if(earlyUnlock) {
+                if (earlyUnlock) {
                     registerEarlyUnlockReceiver()
                 } else {
                     registerNormalReceiver()
@@ -158,7 +162,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         lockStateReceiver = object : BroadcastReceiver() {
             override fun onReceive(p0: Context?, p1: Intent) {
                 val mode = p1.getBooleanExtra(XposedConstants.EXTRA_EARLY_UNLOCK_MODE, false)
-                if(mode) {
+                if (mode) {
                     show()
                 } else {
                     hide()
@@ -177,29 +181,24 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-
-        if(!LibManager.libsLoaded.get()) {
-            // Libs not loaded, abort
+        if (!LibManager.libsLoaded.get()) {
             Log.w(TAG, "Libs not loaded, disabling self...")
-            disableSelf() // This doesn't work in onCreate
+            disableSelf()
             return
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-
         unregisterLockStateReceiver()
         unregisterUnlockReceiver()
         hide()
         serviceJob.cancel()
     }
 
-    // Broadcast receiver isn't 100% accurate
     private fun doubleCheckLockscreenState() {
         val mainDisplayOn = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.state == Display.STATE_ON
-
-        if(mainDisplayOn && keyguardManager?.isKeyguardLocked == true) {
+        if (mainDisplayOn && keyguardManager?.isKeyguardLocked == true) {
             show()
         } else {
             hide()
@@ -207,14 +206,30 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     private fun show() {
-        if(!active) {
-            if(Util.isFaceUnlockEnrolled(this)) {
+        if (!active) {
+            if (Util.isFaceUnlockEnrolled(this)) {
                 active = true
-                // If animation is currently playing, we need to fire it's end listener
-                if(showStatusText) {
+                val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+                val nightLight = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
+
+                // تفعيل إضاءة الشاشة التلقائية في الظلام إذا كان المستخدم قد فعلها
+                params.screenBrightness = if (nightLight) 1.0f else -1.0f
+
+                if (showStatusText || nightLight) {
                     textViewAnimator?.cancel()
-                    textView?.text = "Looking for face..."
-                    windowManager?.addView(textView, params)
+                    textView?.text = if (showStatusText) "جاري التعرف على الوجه..." else ""
+                    if (!viewAdded) {
+                        try {
+                            windowManager?.addView(textView, params)
+                            viewAdded = true
+                        } catch (_: Exception) {
+                        }
+                    } else {
+                        try {
+                            windowManager?.updateViewLayout(textView, params)
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
                 startTime = System.currentTimeMillis()
                 controller?.start()
@@ -223,11 +238,11 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     private fun hide(delay: Int = 0) {
-        if(active) {
+        if (active) {
             active = false
-            if(showStatusText) {
-                if (delay > 0) {
-                    // Delayed hide is animated
+            params.screenBrightness = -1.0f
+            if (viewAdded) {
+                if (delay > 0 && showStatusText) {
                     textViewAnimator = textView?.animate()
                         ?.alpha(0f)
                         ?.setListener(object : Animator.AnimatorListener {
@@ -237,7 +252,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
                             override fun onAnimationRepeat(p0: Animator) {}
                         })
                         ?.setStartDelay(delay.toLong())
-                        ?.setDuration(300)
+                        ?.setDuration(250)
                     textViewAnimator?.start()
                 } else {
                     removeTextViewFromWindowManager()
@@ -245,16 +260,12 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             }
             controller?.stop()
         } else {
-            if(showStatusText) {
-                if (delay == 0) {
-                    // If hide animation is running, skip it
-                    textViewAnimator?.cancel()
-                }
+            if (delay == 0) {
+                textViewAnimator?.cancel()
             }
         }
     }
 
-    // Should reset textview to the state it was in before animation started playing
     private fun onTextViewAnimationEnd() {
         removeTextViewFromWindowManager()
         textViewAnimator?.cancel()
@@ -263,23 +274,41 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     private fun removeTextViewFromWindowManager() {
-        windowManager?.removeView(textView)
+        if (viewAdded) {
+            try {
+                windowManager?.removeView(textView)
+            } catch (_: Exception) {
+            }
+            viewAdded = false
+        }
     }
 
     override fun onAccessibilityEvent(p0: AccessibilityEvent?) {
-        // No need for these events
     }
 
     override fun onInterrupt() {
     }
 
+    @Suppress("DEPRECATION")
     override fun onAuthed() {
         Log.d("MeasureFaceUnlock", "Total time: " + (System.currentTimeMillis() - startTime))
-        // Tell Xposed module to unlock device
-        val unlockAnimation = when(FaceApplication.getApp().prefs.unlockAnimation.get()) {
+
+        val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        if (smartPrefs.getBoolean(SmartFaceEngine.KEY_VIBRATE, true)) {
+            try {
+                val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    vibrator?.vibrate(35)
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val unlockAnimation = when (FaceApplication.getApp().prefs.unlockAnimation.get()) {
             "mode_wake_and_unlock" -> XposedConstants.MODE_WAKE_AND_UNLOCK
             "mode_wake_and_unlock_pulsing" -> XposedConstants.MODE_WAKE_AND_UNLOCK_PULSING
-//            "mode_unlock_fading"
             else -> XposedConstants.MODE_UNLOCK_FADING
         }
         sendBroadcast(Intent(XposedConstants.ACTION_UNLOCK_DEVICE).apply {
@@ -287,15 +316,15 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             putExtra(XposedConstants.EXTRA_BYPASS_KEYGUARD, prefs.bypassKeyguard.get())
         })
         handler?.post {
-            textView?.text = "Welcome!"
-            hide(delay = 1000)
+            textView?.text = "تم الفتح ✓"
+            hide(delay = 800)
         }
     }
 
     override fun onError(errId: Int, message: String) {
         handler?.post {
             textView?.text = message
-            hide(delay = 2000)
+            hide(delay = 1500)
         }
     }
 
