@@ -1,7 +1,6 @@
 package ax.nd.faceunlock.service
 
 import android.accessibilityservice.AccessibilityService
-import android.animation.Animator
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -9,17 +8,19 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
-import android.os.Build
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.util.Log
 import android.util.TypedValue
 import android.view.Display
 import android.view.Gravity
-import android.view.ViewPropertyAnimator
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
@@ -36,7 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbacks {
+class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbacks, SensorEventListener {
     private var windowManager: WindowManager? = null
     private var textView: TextView? = null
     private val params = WindowManager.LayoutParams(
@@ -50,6 +51,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         PixelFormat.TRANSLUCENT
     ).apply {
         gravity = Gravity.TOP
+        screenBrightness = -1.0f
     }
 
     private var active: Boolean = false
@@ -59,16 +61,21 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private var controller: FaceAuthServiceController? = null
     private var keyguardManager: KeyguardManager? = null
     private var displayManager: DisplayManager? = null
+    private var sensorManager: SensorManager? = null
+    private var lightSensor: Sensor? = null
+    private var lastAmbientLux: Float = 100f // افتراض الإضاءة الجيدة حتى يثبت العكس
     private var handler: Handler? = null
-    private var startTime: Long = 0
-    private var textViewAnimator: ViewPropertyAnimator? = null
 
     private lateinit var serviceJob: Job
     private lateinit var serviceScope: CoroutineScope
     private lateinit var prefs: Prefs
-
-    private var showStatusText = true
     private var booted = false
+
+    private val autoTimeoutRunnable = Runnable {
+        if (active) {
+            hide()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -82,13 +89,15 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         windowManager = getSystemService()
         keyguardManager = getSystemService()
         displayManager = getSystemService()
+        sensorManager = getSystemService()
+        lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
         handler = Handler(Looper.getMainLooper())
 
         textView = TextView(this).apply {
-            setTextColor(getColor(android.R.color.white))
-            setShadowLayer(10f, 0f, 0f, Color.BLACK)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setPadding(0, 16.dpToPx.toInt(), 0, 0)
+            setTextColor(Color.WHITE)
+            setShadowLayer(8f, 0f, 0f, Color.BLACK)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setPadding(0, 14.dpToPx.toInt(), 0, 0)
             textAlignment = TextView.TEXT_ALIGNMENT_CENTER
         }
 
@@ -97,12 +106,6 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             reconfigureUnlockHook()
         }
         setupUnlockReceiver()
-
-        serviceScope.launch {
-            prefs.showStatusText.asFlow().collect { showStatusText ->
-                this@LockscreenFaceAuthService.showStatusText = showStatusText
-            }
-        }
     }
 
     private fun setupUnlockReceiver() {
@@ -209,68 +212,50 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         if (!active) {
             if (Util.isFaceUnlockEnrolled(this)) {
                 active = true
-                val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-                val nightLight = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
-
-                // تفعيل إضاءة الشاشة التلقائية في الظلام إذا كان المستخدم قد فعلها
-                params.screenBrightness = if (nightLight) 1.0f else -1.0f
-
-                if (showStatusText || nightLight) {
-                    textViewAnimator?.cancel()
-                    textView?.text = if (showStatusText) "جاري التعرف على الوجه..." else ""
-                    if (!viewAdded) {
-                        try {
-                            windowManager?.addView(textView, params)
-                            viewAdded = true
-                        } catch (_: Exception) {
-                        }
-                    } else {
-                        try {
-                            windowManager?.updateViewLayout(textView, params)
-                        } catch (_: Exception) {
-                        }
-                    }
+                lastAmbientLux = 100f
+                lightSensor?.let {
+                    sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
                 }
-                startTime = System.currentTimeMillis()
+
+                val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+                val showLockText = smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)
+
+                params.screenBrightness = -1.0f
+                if (showLockText) {
+                    textView?.text = "جاري التحقق من الوجه..."
+                    addOrUpdateOverlay()
+                }
+
+                // إيقاف تلقائي بعد 4.5 ثانية لتوفير البطارية إذا لم ينظر أحد للشاشة
+                handler?.removeCallbacks(autoTimeoutRunnable)
+                handler?.postDelayed(autoTimeoutRunnable, 4500L)
+
                 controller?.start()
             }
         }
     }
 
-    private fun hide(delay: Int = 0) {
+    private fun hide() {
+        handler?.removeCallbacks(autoTimeoutRunnable)
+        sensorManager?.unregisterListener(this)
         if (active) {
             active = false
             params.screenBrightness = -1.0f
-            if (viewAdded) {
-                if (delay > 0 && showStatusText) {
-                    textViewAnimator = textView?.animate()
-                        ?.alpha(0f)
-                        ?.setListener(object : Animator.AnimatorListener {
-                            override fun onAnimationStart(p0: Animator) {}
-                            override fun onAnimationEnd(p0: Animator) = onTextViewAnimationEnd()
-                            override fun onAnimationCancel(p0: Animator) {}
-                            override fun onAnimationRepeat(p0: Animator) {}
-                        })
-                        ?.setStartDelay(delay.toLong())
-                        ?.setDuration(250)
-                    textViewAnimator?.start()
-                } else {
-                    removeTextViewFromWindowManager()
-                }
-            }
+            removeTextViewFromWindowManager()
             controller?.stop()
-        } else {
-            if (delay == 0) {
-                textViewAnimator?.cancel()
-            }
         }
     }
 
-    private fun onTextViewAnimationEnd() {
-        removeTextViewFromWindowManager()
-        textViewAnimator?.cancel()
-        textViewAnimator = null
-        textView?.alpha = 1f
+    private fun addOrUpdateOverlay() {
+        try {
+            if (!viewAdded) {
+                windowManager?.addView(textView, params)
+                viewAdded = true
+            } else {
+                windowManager?.updateViewLayout(textView, params)
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun removeTextViewFromWindowManager() {
@@ -283,25 +268,45 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (!active || event?.sensor?.type != Sensor.TYPE_LIGHT) return
+        lastAmbientLux = event.values.firstOrNull() ?: 100f
+        val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
+
+        // رفع السطوع فقط إذا كان الخيار مفعلاً والغرفة مظلمة فعلياً (أقل من 12 لوكس)
+        if (nightLightEnabled && lastAmbientLux < 12f) {
+            if (params.screenBrightness != 0.72f) {
+                params.screenBrightness = 0.72f
+                textView?.text = ""
+                addOrUpdateOverlay()
+            }
+        } else if (params.screenBrightness > 0f) {
+            params.screenBrightness = -1.0f
+            if (!smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)) {
+                removeTextViewFromWindowManager()
+            } else {
+                addOrUpdateOverlay()
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+    }
+
     override fun onAccessibilityEvent(p0: AccessibilityEvent?) {
     }
 
     override fun onInterrupt() {
     }
 
-    @Suppress("DEPRECATION")
     override fun onAuthed() {
-        Log.d("MeasureFaceUnlock", "Total time: " + (System.currentTimeMillis() - startTime))
-
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-        if (smartPrefs.getBoolean(SmartFaceEngine.KEY_VIBRATE, true)) {
+        if (smartPrefs.getBoolean(SmartFaceEngine.KEY_UNLOCK_CHIME, false)) {
             try {
-                val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    vibrator?.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
-                } else {
-                    vibrator?.vibrate(35)
-                }
+                val tone = ToneGenerator(AudioManager.STREAM_SYSTEM, 40)
+                tone.startTone(ToneGenerator.TONE_PROP_ACK, 45)
+                handler?.postDelayed({ tone.release() }, 120)
             } catch (_: Exception) {
             }
         }
@@ -316,15 +321,19 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             putExtra(XposedConstants.EXTRA_BYPASS_KEYGUARD, prefs.bypassKeyguard.get())
         })
         handler?.post {
-            textView?.text = "تم الفتح ✓"
-            hide(delay = 800)
+            hide()
         }
     }
 
     override fun onError(errId: Int, message: String) {
         handler?.post {
-            textView?.text = message
-            hide(delay = 1500)
+            val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+            if (smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)) {
+                textView?.text = message
+                handler?.postDelayed({ hide() }, 1000)
+            } else {
+                hide()
+            }
         }
     }
 
