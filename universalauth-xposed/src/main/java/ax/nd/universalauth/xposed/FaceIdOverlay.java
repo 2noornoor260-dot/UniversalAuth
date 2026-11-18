@@ -12,10 +12,6 @@ import android.graphics.Path;
 import android.graphics.PathMeasure;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
@@ -40,25 +36,30 @@ public class FaceIdOverlay extends View {
     private static final int STATE_SUCCESS = 1;
     private static final int STATE_FAILURE = 2;
 
-    private static final long WAKE_APPEAR_DELAY_MS = 120L;
-    private static final long SCAN_TIMEOUT_MS = 5200L;
-    private static final float DARK_LUX_THRESHOLD = 8.0f; // يعمل فقط في الظلام الحقيقي
+    private static final long SCAN_TIMEOUT_MS = 6000L; // يغطي محاولتي مسح حقيقيتين كاملتين
 
     private static FaceIdOverlay instance;
     private static View fillLightView;
-    private static SensorManager lightSensorManager;
-    private static SensorEventListener lightSensorListener;
-    private static boolean fillLightTriggered = false;
+    private static WindowManager.LayoutParams fillLightParams;
+    private static ValueAnimator fillLightAnimator;
 
-    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static Handler mainHandler;
+
+    private static Handler getMainHandler() {
+        if (mainHandler == null) {
+            Looper looper = Looper.getMainLooper();
+            if (looper != null) {
+                mainHandler = new Handler(looper);
+            }
+        }
+        return mainHandler;
+    }
 
     private static final Runnable timeoutRunnable = () -> {
         if (instance != null && instance.state == STATE_SCANNING) {
             instance.triggerFailureAnimation();
         }
     };
-
-    private static Runnable pendingShowRunnable;
 
     private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -73,6 +74,7 @@ public class FaceIdOverlay extends View {
     private WindowManager.LayoutParams layoutParams;
     private int edgeGravity = Gravity.TOP;
     private int state = STATE_SCANNING;
+    private boolean isRetrying = false;
 
     private float scanAngle = 0f;
     private float morphProgress = 0f;
@@ -87,9 +89,9 @@ public class FaceIdOverlay extends View {
         bgPaint.setColor(Color.parseColor("#F50C0C0F"));
         bgPaint.setStyle(Paint.Style.FILL);
 
-        borderPaint.setColor(Color.parseColor("#2EFFFFFF"));
+        borderPaint.setColor(Color.parseColor("#33FFFFFF"));
         borderPaint.setStyle(Paint.Style.STROKE);
-        borderPaint.setStrokeWidth(dp(context, 1.1f));
+        borderPaint.setStrokeWidth(dp(context, 1.2f));
 
         glyphPaint.setColor(Color.parseColor("#F2F2F7"));
         glyphPaint.setStyle(Paint.Style.STROKE);
@@ -98,17 +100,17 @@ public class FaceIdOverlay extends View {
     }
 
     public static void showScanning(Context context) {
-        if (context == null) return;
-        mainHandler.post(() -> {
-            if (pendingShowRunnable != null) {
-                mainHandler.removeCallbacks(pendingShowRunnable);
-            }
-            pendingShowRunnable = () -> showScanningInternal(context);
-            mainHandler.postDelayed(pendingShowRunnable, WAKE_APPEAR_DELAY_MS);
-        });
+        showScanning(context, false);
     }
 
-    private static void showScanningInternal(Context context) {
+    public static void showScanning(Context context, boolean isDarkEnvironment) {
+        if (context == null) return;
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> showScanningInternal(context, isDarkEnvironment));
+    }
+
+    private static void showScanningInternal(Context context, boolean isDarkEnvironment) {
         try {
             if (instance != null && instance.isAttachedToWindow()) {
                 if (instance.state == STATE_SCANNING) return;
@@ -119,7 +121,9 @@ public class FaceIdOverlay extends View {
             WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
             if (wm == null) return;
 
-            startAmbientLightCheck(appCtx);
+            if (isDarkEnvironment) {
+                showSmoothFillLight(appCtx);
+            }
 
             FaceIdOverlay view = new FaceIdOverlay(appCtx);
             int sizePx = dp(appCtx, 68);
@@ -163,88 +167,76 @@ public class FaceIdOverlay extends View {
             view.playEmergenceAnimation();
             view.startScanningLoop();
 
-            mainHandler.removeCallbacks(timeoutRunnable);
-            mainHandler.postDelayed(timeoutRunnable, SCAN_TIMEOUT_MS);
+            Handler h = getMainHandler();
+            if (h != null) {
+                h.removeCallbacks(timeoutRunnable);
+                h.postDelayed(timeoutRunnable, SCAN_TIMEOUT_MS);
+            }
         } catch (Throwable ignored) {
         }
     }
 
-    public static void triggerRetryPulse() {
-        mainHandler.post(() -> {
-            if (instance != null && instance.state == STATE_SCANNING && instance.isAttachedToWindow()) {
-                instance.animate()
-                        .scaleX(0.88f)
-                        .scaleY(0.88f)
-                        .setDuration(100)
-                        .withEndAction(() -> {
-                            if (instance != null && instance.isAttachedToWindow()) {
-                                instance.animate()
-                                        .scaleX(1.05f)
-                                        .scaleY(1.05f)
-                                        .setDuration(130)
-                                        .withEndAction(() -> {
-                                            if (instance != null && instance.isAttachedToWindow()) {
-                                                instance.animate().scaleX(1f).scaleY(1f).setDuration(110).start();
-                                            }
-                                        })
-                                        .start();
-                            }
-                        })
-                        .start();
-            }
+    public static void triggerRetryTransition() {
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            if (instance == null || instance.state != STATE_SCANNING || !instance.isAttachedToWindow()) return;
+            FaceIdOverlay view = instance;
+            view.isRetrying = true;
+            view.invalidate();
+            view.vibrateRetryTick();
+
+            // 1. اهتزاز أفقي واضح وتصغير للكبسولة للإشارة إلى فشل المحاولة الأولى
+            float d = dp(view.getContext(), 7);
+            ObjectAnimator shake = ObjectAnimator.ofFloat(
+                    view,
+                    "translationX",
+                    0f, -d, d, -d * 0.7f, d * 0.7f, 0f
+            );
+            shake.setDuration(300);
+            shake.setInterpolator(new DecelerateInterpolator());
+            shake.start();
+
+            view.animate()
+                    .scaleX(0.82f)
+                    .scaleY(0.82f)
+                    .setDuration(220)
+                    .withEndAction(() -> {
+                        if (instance != null && instance.isAttachedToWindow()) {
+                            // 2. نبضة توسّع نشطة لبدء المحاولة الثانية الحقيقية
+                            instance.isRetrying = false;
+                            instance.invalidate();
+                            instance.animate()
+                                    .scaleX(1.10f)
+                                    .scaleY(1.10f)
+                                    .setDuration(150)
+                                    .withEndAction(() -> {
+                                        if (instance != null && instance.isAttachedToWindow()) {
+                                            instance.animate()
+                                                    .scaleX(1f)
+                                                    .scaleY(1f)
+                                                    .setDuration(130)
+                                                    .start();
+                                        }
+                                    })
+                                    .start();
+                        }
+                    })
+                    .start();
         });
     }
 
-    private static void startAmbientLightCheck(Context appCtx) {
-        stopAmbientLightCheck();
-        fillLightTriggered = false;
-        try {
-            lightSensorManager = (SensorManager) appCtx.getSystemService(Context.SENSOR_SERVICE);
-            if (lightSensorManager == null) return;
-            Sensor lightSensor = lightSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
-            if (lightSensor == null) return;
-
-            lightSensorListener = new SensorEventListener() {
-                @Override
-                public void onSensorChanged(SensorEvent event) {
-                    if (event.values != null && event.values.length > 0) {
-                        float lux = event.values[0];
-                        if (lux <= DARK_LUX_THRESHOLD && !fillLightTriggered && instance != null && instance.state == STATE_SCANNING) {
-                            fillLightTriggered = true;
-                            showSmoothFillLight(appCtx);
-                        }
-                        stopAmbientLightCheck();
-                    }
-                }
-
-                @Override
-                public void onAccuracyChanged(Sensor sensor, int accuracy) {
-                }
-            };
-            lightSensorManager.registerListener(lightSensorListener, lightSensor, SensorManager.SENSOR_DELAY_FASTEST);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void stopAmbientLightCheck() {
-        if (lightSensorManager != null && lightSensorListener != null) {
-            try {
-                lightSensorManager.unregisterListener(lightSensorListener);
-            } catch (Throwable ignored) {
-            }
-        }
-        lightSensorListener = null;
-    }
-
     private static void showSmoothFillLight(Context appCtx) {
-        mainHandler.post(() -> {
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
             try {
-                if (fillLightView != null || instance == null || instance.state != STATE_SCANNING) return;
+                if (fillLightView != null) return;
                 WindowManager wm = (WindowManager) appCtx.getSystemService(Context.WINDOW_SERVICE);
                 if (wm == null) return;
 
                 View lightPanel = new View(appCtx);
-                lightPanel.setBackgroundColor(Color.parseColor("#FFF8EE"));
+                lightPanel.setBackgroundColor(Color.WHITE);
                 lightPanel.setAlpha(0f);
 
                 int[] windowTypes = new int[]{
@@ -266,21 +258,36 @@ public class FaceIdOverlay extends View {
                                         | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
                                 PixelFormat.TRANSLUCENT
                         );
+                        params.screenBrightness = 0.15f;
                         applyTrustedOverlayFlag(params);
 
                         wm.addView(lightPanel, params);
                         fillLightView = lightPanel;
+                        fillLightParams = params;
 
+                        // إبقاء كبسولة Face ID فوق طبقة الإضاءة البيضاء
                         if (instance != null && instance.isAttachedToWindow()) {
                             wm.removeViewImmediate(instance);
                             wm.addView(instance, instance.layoutParams);
                         }
 
-                        lightPanel.animate()
-                                .alpha(0.52f)
-                                .setDuration(480)
-                                .setInterpolator(new DecelerateInterpolator())
-                                .start();
+                        // تدرج سريع وسلس خلال 450ms وصولاً إلى 100% سطوع كامل
+                        if (fillLightAnimator != null) fillLightAnimator.cancel();
+                        fillLightAnimator = ValueAnimator.ofFloat(0f, 1f);
+                        fillLightAnimator.setDuration(450L);
+                        fillLightAnimator.setInterpolator(new DecelerateInterpolator());
+                        fillLightAnimator.addUpdateListener(anim -> {
+                            float p = (float) anim.getAnimatedValue();
+                            if (fillLightView != null && fillLightParams != null && fillLightView.isAttachedToWindow()) {
+                                fillLightView.setAlpha(p * 0.96f);
+                                fillLightParams.screenBrightness = 0.15f + (p * 0.85f);
+                                try {
+                                    wm.updateViewLayout(fillLightView, fillLightParams);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                        fillLightAnimator.start();
                         break;
                     } catch (Throwable ignored) {
                     }
@@ -291,9 +298,14 @@ public class FaceIdOverlay extends View {
     }
 
     private static void hideSmoothFillLight(boolean immediate) {
+        if (fillLightAnimator != null) {
+            fillLightAnimator.cancel();
+            fillLightAnimator = null;
+        }
         if (fillLightView == null) return;
         View panel = fillLightView;
         fillLightView = null;
+        fillLightParams = null;
 
         if (immediate) {
             try {
@@ -308,7 +320,7 @@ public class FaceIdOverlay extends View {
 
         panel.animate()
                 .alpha(0f)
-                .setDuration(300)
+                .setDuration(260)
                 .setInterpolator(new DecelerateInterpolator())
                 .setListener(new AnimatorListenerAdapter() {
                     @Override
@@ -335,17 +347,14 @@ public class FaceIdOverlay extends View {
 
     public static void showSuccess(Context context) {
         if (context == null) return;
-        mainHandler.post(() -> {
-            if (pendingShowRunnable != null) {
-                mainHandler.removeCallbacks(pendingShowRunnable);
-                pendingShowRunnable = null;
-            }
-            mainHandler.removeCallbacks(timeoutRunnable);
-            stopAmbientLightCheck();
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            h.removeCallbacks(timeoutRunnable);
             hideSmoothFillLight(false);
 
             if (instance == null || !instance.isAttachedToWindow()) {
-                showScanningInternal(context);
+                showScanningInternal(context, false);
             }
             if (instance != null) {
                 instance.triggerSuccessAnimation();
@@ -355,13 +364,10 @@ public class FaceIdOverlay extends View {
 
     public static void showFailure(Context context) {
         if (context == null) return;
-        mainHandler.post(() -> {
-            if (pendingShowRunnable != null) {
-                mainHandler.removeCallbacks(pendingShowRunnable);
-                pendingShowRunnable = null;
-            }
-            mainHandler.removeCallbacks(timeoutRunnable);
-            stopAmbientLightCheck();
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            h.removeCallbacks(timeoutRunnable);
             hideSmoothFillLight(false);
 
             if (instance != null && instance.isAttachedToWindow()) {
@@ -371,13 +377,10 @@ public class FaceIdOverlay extends View {
     }
 
     public static void hide() {
-        mainHandler.post(() -> {
-            if (pendingShowRunnable != null) {
-                mainHandler.removeCallbacks(pendingShowRunnable);
-                pendingShowRunnable = null;
-            }
-            mainHandler.removeCallbacks(timeoutRunnable);
-            stopAmbientLightCheck();
+        Handler h = getMainHandler();
+        if (h == null) return;
+        h.post(() -> {
+            h.removeCallbacks(timeoutRunnable);
             hideSmoothFillLight(false);
 
             if (instance != null && (instance.state == STATE_SUCCESS || instance.state == STATE_FAILURE)) {
@@ -473,7 +476,7 @@ public class FaceIdOverlay extends View {
                     }
                 }
             };
-            dm.registerDisplayListener(displayListener, mainHandler);
+            dm.registerDisplayListener(displayListener, getMainHandler());
         } catch (Throwable ignored) {
         }
     }
@@ -513,7 +516,7 @@ public class FaceIdOverlay extends View {
                 .alpha(1f)
                 .translationX(0f)
                 .translationY(0f)
-                .setDuration(320)
+                .setDuration(300)
                 .setInterpolator(new OvershootInterpolator(1.3f))
                 .start();
     }
@@ -533,7 +536,7 @@ public class FaceIdOverlay extends View {
     private void triggerSuccessAnimation() {
         if (state == STATE_SUCCESS) return;
         state = STATE_SUCCESS;
-        stopAmbientLightCheck();
+        isRetrying = false;
         hideSmoothFillLight(false);
         if (scanAnimator != null) scanAnimator.cancel();
         if (stateAnimator != null) stateAnimator.cancel();
@@ -559,13 +562,16 @@ public class FaceIdOverlay extends View {
         });
         stateAnimator.start();
 
-        mainHandler.postDelayed(() -> removeInternal(false), 1000);
+        Handler h = getMainHandler();
+        if (h != null) {
+            h.postDelayed(() -> removeInternal(false), 1000);
+        }
     }
 
     private void triggerFailureAnimation() {
         if (state != STATE_SCANNING) return;
         state = STATE_FAILURE;
-        stopAmbientLightCheck();
+        isRetrying = false;
         hideSmoothFillLight(false);
         if (scanAnimator != null) scanAnimator.cancel();
         if (stateAnimator != null) stateAnimator.cancel();
@@ -583,7 +589,23 @@ public class FaceIdOverlay extends View {
         shake.setInterpolator(new DecelerateInterpolator());
         shake.start();
 
-        mainHandler.postDelayed(() -> removeInternal(false), 750);
+        Handler h = getMainHandler();
+        if (h != null) {
+            h.postDelayed(() -> removeInternal(false), 750);
+        }
+    }
+
+    private void vibrateRetryTick() {
+        try {
+            Vibrator vibrator = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator == null || !vibrator.hasVibrator()) return;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));
+            } else {
+                vibrator.vibrate(15);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private void vibrateHaptic(boolean isError) {
@@ -601,7 +623,6 @@ public class FaceIdOverlay extends View {
     }
 
     private static void removeInternal(boolean immediate) {
-        stopAmbientLightCheck();
         hideSmoothFillLight(immediate);
         if (instance == null) return;
         FaceIdOverlay view = instance;
@@ -661,6 +682,14 @@ public class FaceIdOverlay extends View {
         float pad = dp(getContext(), 3.5f);
         pillRect.set(pad, pad, w - pad, h - pad);
 
+        if (isRetrying) {
+            borderPaint.setColor(Color.parseColor("#CCFF6B35"));
+            borderPaint.setStrokeWidth(dp(getContext(), 1.8f));
+        } else {
+            borderPaint.setColor(Color.parseColor("#33FFFFFF"));
+            borderPaint.setStrokeWidth(dp(getContext(), 1.2f));
+        }
+
         float cornerRadius = dp(getContext(), 20) + (morphProgress * (w / 2f));
         canvas.drawRoundRect(pillRect, cornerRadius, cornerRadius, bgPaint);
         canvas.drawRoundRect(pillRect, cornerRadius, cornerRadius, borderPaint);
@@ -687,15 +716,21 @@ public class FaceIdOverlay extends View {
         }
 
         boolean isFail = (state == STATE_FAILURE);
-        float breath = isFail ? 0f : (float) Math.sin(scanAngle);
-        float lookX = isFail ? 0f : (float) Math.sin(scanAngle) * dp(getContext(), 1.6f);
-        float lookY = isFail ? 0f : (float) Math.cos(scanAngle * 2.0) * dp(getContext(), 0.9f);
+        float breath = (isFail || isRetrying) ? 0f : (float) Math.sin(scanAngle);
+        float lookX = (isFail || isRetrying) ? 0f : (float) Math.sin(scanAngle) * dp(getContext(), 1.6f);
+        float lookY = (isFail || isRetrying) ? 0f : (float) Math.cos(scanAngle * 2.0) * dp(getContext(), 0.9f);
 
         float boxHalf = dp(getContext(), 14.5f) + (breath * dp(getContext(), 0.8f));
         float bracketLen = dp(getContext(), 6.2f);
         float arcR = dp(getContext(), 3.5f);
 
-        glyphPaint.setColor(isFail ? Color.parseColor("#FF3B30") : Color.parseColor("#F2F2F7"));
+        if (isFail) {
+            glyphPaint.setColor(Color.parseColor("#FF3B30"));
+        } else if (isRetrying) {
+            glyphPaint.setColor(Color.parseColor("#FF6B35"));
+        } else {
+            glyphPaint.setColor(Color.parseColor("#F2F2F7"));
+        }
         glyphPaint.setAlpha(255);
         glyphPaint.setStrokeWidth(dp(getContext(), 2.3f));
 
@@ -706,7 +741,7 @@ public class FaceIdOverlay extends View {
         float eyeOffsetX = dp(getContext(), 5.2f);
         float eyeOffsetY = dp(getContext(), 3.2f);
 
-        float blinkFactor = (!isFail && Math.sin(scanAngle) > 0.94f) ? 0.25f : 1f;
+        float blinkFactor = (!isFail && !isRetrying && Math.sin(scanAngle) > 0.94f) ? 0.25f : 1f;
         float eyeHalfH = dp(getContext(), 2.1f) * blinkFactor;
 
         glyphPaint.setStrokeWidth(dp(getContext(), 2.2f));
@@ -723,7 +758,7 @@ public class FaceIdOverlay extends View {
         canvas.drawPath(nosePath, glyphPaint);
 
         glyphPaint.setStrokeWidth(dp(getContext(), 2.1f));
-        if (!isFail) {
+        if (!isFail && !isRetrying) {
             mouthRect.set(
                     fcx - dp(getContext(), 5.2f),
                     fcy + dp(getContext(), 1.2f),
@@ -780,4 +815,4 @@ public class FaceIdOverlay extends View {
     private static int dp(Context ctx, float dp) {
         return Math.round(dp * ctx.getResources().getDisplayMetrics().density);
     }
-                    }
+    }
