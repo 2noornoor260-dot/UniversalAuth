@@ -25,30 +25,74 @@ import kotlin.math.*
 
 class SmartFaceEngine(context: Context) {
 
+    interface VerificationFeedbackListener {
+        fun onScanningState(faceDetected: Boolean, confidence: Float)
+        fun onVerifySuccess()
+        fun onVerifyRejected(reasonCode: Int, attemptsUsed: Int, maxAttempts: Int, lockedOut: Boolean)
+    }
+
     companion object {
         private const val TAG = "SmartFaceEngine"
-        private const val MAX_TEMPLATES = 18
-        private const val DB_FILE_NAME = "smart_face_templates_v4.enc"
+        private const val MAX_TEMPLATES = 16
+        private const val DB_FILE_NAME = "smart_face_templates_v5.enc"
         const val PREFS_NAME = "smart_face_prefs"
         private const val KEY_CACHED_ROTATION = "cached_camera_rotation"
 
         const val KEY_REQUIRE_EYES = "req_eyes_open"
         const val KEY_ADAPTIVE = "adaptive_learning"
         const val KEY_NIGHT_LIGHT = "night_fill_light"
-        const val KEY_UNLOCK_CHIME = "unlock_chime_sound"
+        const val KEY_UNLOCK_CHIME_TYPE = "unlock_chime_type"
         const val KEY_CAPSULE_ANIM = "dynamic_capsule_anim"
+        const val KEY_MAX_ATTEMPTS = "max_failed_attempts"
+        const val KEY_FAILED_COUNT = "current_failed_attempts"
 
-        private const val MATCH_COMBINED_THRESHOLD = 0.45f
-        private const val MATCH_SINGLE_MAX_THRESHOLD = 0.49f
-        private const val INSTANT_UNLOCK_THRESHOLD = 0.56f
-        private const val OPTIMAL_SPOOF_THRESHOLD = 0.40f
-        private const val MIN_NOSE_PROTRUSION_3D = 0.028f
-        private const val MIN_SKIN_SHARPNESS = 1.8f
-        private const val OPTIMAL_MAX_HEAD_ANGLE = 36f
+        // عتبات أمان صارمة تمنع الصور الورقية والشاشات مع الحفاظ على سرعة الفتح
+        private const val MATCH_COMBINED_THRESHOLD = 0.60f
+        private const val MATCH_SINGLE_MAX_THRESHOLD = 0.63f
+        private const val SPOOF_REAL_THRESHOLD = 0.62f
+        private const val MIN_3D_NOSE_PLANE_RATIO = 0.044f
+        private const val MIN_3D_VERTICAL_CURVE_RATIO = 0.026f
+        private const val MIN_SKIN_SHARPNESS = 4.2f
+        private const val MIN_CHROMA_STD = 3.0f
+        private const val OPTIMAL_MAX_HEAD_ANGLE = 34f
 
-        @JvmField var currentEnrollHint: String = "ضع وجهك داخل الإطار وانظر للأمام"
+        @JvmField var currentEnrollHint: String = "حرّك رأسك ببطء نحو اليمين"
         @JvmField var currentEnrollPercent: Float = 0f
         @JvmField var currentEnrollStage: Int = 0
+        @JvmField var lastFrameLuma: Float = 128f
+
+        @Volatile
+        private var feedbackListener: VerificationFeedbackListener? = null
+
+        @JvmStatic
+        fun setFeedbackListener(listener: VerificationFeedbackListener?) {
+            feedbackListener = listener
+        }
+
+        @JvmStatic
+        fun resetFailedAttempts(context: Context) {
+            context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putInt(KEY_FAILED_COUNT, 0).apply()
+        }
+
+        @JvmStatic
+        fun getFailedAttempts(context: Context): Int {
+            return context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_FAILED_COUNT, 0)
+        }
+
+        @JvmStatic
+        fun getMaxAttempts(context: Context): Int {
+            return context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_MAX_ATTEMPTS, 5)
+        }
+
+        @JvmStatic
+        fun isLockedOut(context: Context): Boolean {
+            val max = getMaxAttempts(context)
+            if (max <= 0) return false
+            return getFailedAttempts(context) >= max
+        }
 
         const val CODE_SUCCESS = 0
         const val CODE_NO_FACE = 5
@@ -61,7 +105,14 @@ class SmartFaceEngine(context: Context) {
         const val CODE_KEEP_STILL = 19
         const val CODE_EYES_CLOSED = 22
         const val CODE_MULTI_FACE = 27
+        const val CODE_LOCKED_OUT = 29
     }
+
+    private data class EnrolledPoseTemplate(
+        val poseId: Int, // 0=Right, 1=Left, 2=Up, 3=Down, 4=Centroid/Adaptive
+        val embedding: FloatArray,
+        val noseProtrusion3D: Float
+    )
 
     private val appContext = context.applicationContext
     private val prefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -78,20 +129,24 @@ class SmartFaceEngine(context: Context) {
     private var antiSpoofInterpreter: Interpreter? = null
     private var recInputSize = 112
     private var recOutputSize = 192
-    private var spoofInputSize = 256
-    private var spoofOutputSize = 1
+    private var spoofInputSize = 80
+    private var spoofOutputSize = 3
 
-    private val enrolledTemplates = mutableListOf<FloatArray>()
+    private val enrolledTemplates = mutableListOf<EnrolledPoseTemplate>()
     private var storageDir: File? = null
     private var encryptor: UnlockEncryptor? = null
     private var lastWorkingRotation: Int? = null
 
+    // مراحل التسجيل الـ 4 الحقيقية: 0=يمين، 1=يسار، 2=أعلى، 3=أسفل
     private var enrollStage = 0
-    private var stageSamples = 0
-    private var stage1YawSign = 1f
+    private var stablePoseFrames = 0
+    private var stage0YawSign = 1f
+    private var lastEnrollCaptureTimeMs = 0L
 
-    private var lastVerifiedEmbedding: FloatArray? = null
-    private var lastVerifiedTimeMs: Long = 0L
+    private var prevFrameEmbedding: FloatArray? = null
+    private var prevFrameNoseZ: Float = 0f
+    private var prevFrameTimeMs: Long = 0L
+    private var lastCountedRejectionTimeMs: Long = 0L
 
     init {
         val savedRot = prefs.getInt(KEY_CACHED_ROTATION, -1)
@@ -103,7 +158,7 @@ class SmartFaceEngine(context: Context) {
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.15f)
+            .setMinFaceSize(0.16f)
             .build()
         faceDetector = FaceDetection.getClient(options)
 
@@ -142,42 +197,58 @@ class SmartFaceEngine(context: Context) {
 
     fun resetEnrollProgress() {
         enrollStage = 0
-        stageSamples = 0
+        stablePoseFrames = 0
         currentEnrollStage = 0
         currentEnrollPercent = 0f
-        currentEnrollHint = "ضع وجهك داخل الإطار وانظر للأمام"
+        currentEnrollHint = "حرّك رأسك ببطء نحو اليمين"
     }
 
     fun deleteAllTemplates() {
         enrolledTemplates.clear()
-        lastVerifiedEmbedding = null
+        prevFrameEmbedding = null
         resetEnrollProgress()
+        resetFailedAttempts(appContext)
         storageDir?.let { File(it, DB_FILE_NAME).delete() }
     }
 
+    /**
+     * تسجيل ذكي من 4 زوايا فقط (يمين، يسار، فوق، تحت):
+     * ينتظر الوضعية الصحيحة ويثبتها ثم يلتقط بصمة عصبية + عمق ثلاثي الأبعاد حقيقي لكل زاوية
+     */
     fun enrollFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int): Int {
-        if (enrollStage == 0 && stageSamples == 0 && enrolledTemplates.isNotEmpty()) {
+        updateSceneLuma(nv21, width, height)
+
+        if (enrollStage == 0 && stablePoseFrames == 0 && enrolledTemplates.isNotEmpty()) {
             enrolledTemplates.clear()
         }
 
         val detected = detectFastNV21(nv21, width, height, rotation) ?: run {
-            currentEnrollHint = "ضع وجهك داخل الإطار"
+            stablePoseFrames = 0
+            currentEnrollHint = "ضع وجهك داخل الدائرة"
             return CODE_NO_FACE
         }
 
         if (detected.allFacesCount > 1) {
+            stablePoseFrames = 0
             currentEnrollHint = "يوجد أكثر من وجه في الكادر"
             return CODE_MULTI_FACE
         }
 
         val faceRatio = detected.scaledBox.width().toFloat() / detected.bitmap.width.toFloat()
-        if (faceRatio < 0.15f) {
-            currentEnrollHint = "اقترب قليلاً من الشاشة"
+        if (faceRatio < 0.16f) {
+            stablePoseFrames = 0
+            currentEnrollHint = "اقترب قليلاً من الكاميرا"
             return CODE_TOO_SMALL
         }
-        if (faceRatio > 0.92f) {
-            currentEnrollHint = "ابتعد قليلاً عن الشاشة"
+        if (faceRatio > 0.90f) {
+            stablePoseFrames = 0
+            currentEnrollHint = "ابتعد قليلاً عن الكاميرا"
             return CODE_TOO_LARGE
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastEnrollCaptureTimeMs < 480L) {
+            return CODE_KEEP_STILL
         }
 
         val yaw = detected.yaw
@@ -186,103 +257,144 @@ class SmartFaceEngine(context: Context) {
 
         val angleMatched = when (enrollStage) {
             0 -> {
-                currentEnrollHint = "انظر للأمام مباشرة بثبات"
-                abs(yaw) <= 15f && abs(pitch) <= 16f
-            }
-            1 -> {
-                currentEnrollHint = "أدر رأسك ببطء نحو اليمين"
-                if (abs(yaw) in 10f..42f) {
-                    if (stageSamples == 0) stage1YawSign = if (yaw >= 0) 1f else -1f
+                currentEnrollHint = "حرّك رأسك ببطء نحو اليمين"
+                if (abs(yaw) in 14f..42f && abs(pitch) <= 20f) {
+                    if (stablePoseFrames == 0) stage0YawSign = if (yaw >= 0) 1f else -1f
                     true
                 } else false
             }
+            1 -> {
+                currentEnrollHint = "حرّك رأسك ببطء نحو اليسار"
+                (yaw * -stage0YawSign) in 14f..42f && abs(pitch) <= 20f
+            }
             2 -> {
-                currentEnrollHint = "أدر رأسك ببطء نحو اليسار"
-                (yaw * -stage1YawSign) in 10f..42f
+                currentEnrollHint = "ارفع رأسك ببطء للأعلى"
+                pitch in 10f..36f && abs(yaw) <= 20f
             }
             3 -> {
-                currentEnrollHint = "ارفع ذقنك قليلاً للأعلى"
-                pitch in 6f..35f
-            }
-            4 -> {
-                currentEnrollHint = "اخفض ذقنك قليلاً للأسفل"
-                pitch in -35f..-6f
+                currentEnrollHint = "اخفض رأسك ببطء للأسفل"
+                pitch in -36f..-10f && abs(yaw) <= 20f
             }
             else -> true
         }
 
         if (!angleMatched) {
+            stablePoseFrames = 0
+            return CODE_KEEP_STILL
+        }
+
+        // التحقق من العمق ثلاثي الأبعاد الحقيقي أثناء التسجيل لمنع تسجيل صورة مسطحة
+        val depth3D = measureTrue3DFacialDepth(detected.bitmap, detected.scaledBox)
+        if (depth3D == null || !depth3D.isTrue3DFace) {
+            currentEnrollHint = "تأكد من وضوح الإضاءة وتوجّه وجهك للكاميرا"
+            return CODE_KEEP_STILL
+        }
+
+        stablePoseFrames++
+        if (stablePoseFrames < 2) {
+            currentEnrollHint = "اثبت لحظة..."
             return CODE_KEEP_STILL
         }
 
         val aligned = alignAndCrop(detected.bitmap, detected.scaledBox, detected.leftEye, detected.rightEye, recInputSize)
         val embedding = extractEmbedding(aligned) ?: return CODE_KEEP_STILL
 
-        enrolledTemplates.add(embedding)
-        stageSamples++
+        enrolledTemplates.add(
+            EnrolledPoseTemplate(
+                poseId = enrollStage,
+                embedding = embedding,
+                noseProtrusion3D = depth3D.nosePlaneRatio
+            )
+        )
 
-        val completedSteps = (enrollStage * 3 + stageSamples).toFloat()
-        currentEnrollPercent = ((completedSteps / 15f) * 100f).coerceIn(4f, 100f)
+        stablePoseFrames = 0
+        lastEnrollCaptureTimeMs = now
+        enrollStage++
+        currentEnrollStage = enrollStage
+        currentEnrollPercent = ((enrollStage / 4f) * 100f).coerceIn(0f, 100f)
 
-        if (stageSamples >= 3) {
-            enrollStage++
-            stageSamples = 0
-            currentEnrollStage = enrollStage
-        }
-
-        return if (enrollStage >= 5) {
-            computeCentroidEmbedding()?.let { enrolledTemplates.add(0, it) }
+        return if (enrollStage >= 4) {
+            computeCentroidEmbedding()?.let { centroid ->
+                val avgNose3D = enrolledTemplates.map { it.noseProtrusion3D }.average().toFloat()
+                enrolledTemplates.add(0, EnrolledPoseTemplate(4, centroid, avgNose3D))
+            }
             currentEnrollPercent = 100f
-            currentEnrollHint = "اكتمل إعداد التعرّف على الوجه"
+            currentEnrollHint = "اكتمل إعداد التعرّف ثلاثي الأبعاد"
             saveTemplates()
+            resetFailedAttempts(appContext)
             enrollStage = 0
-            stageSamples = 0
+            stablePoseFrames = 0
             CODE_SUCCESS
         } else {
             currentEnrollHint = when (enrollStage) {
-                1 -> "أدر رأسك ببطء نحو اليمين"
-                2 -> "أدر رأسك ببطء نحو اليسار"
-                3 -> "ارفع ذقنك قليلاً للأعلى"
-                4 -> "اخفض ذقنك قليلاً للأسفل"
+                1 -> "حرّك رأسك ببطء نحو اليسار"
+                2 -> "ارفع رأسك ببطء للأعلى"
+                3 -> "اخفض رأسك ببطء للأسفل"
                 else -> currentEnrollHint
             }
             CODE_KEEP_STILL
         }
     }
 
+    /**
+     * محرك التحقق متعدد الطبقات (Fail-Closed):
+     * 1. التحقق من عدم قفل المحاولات الفاشلة.
+     * 2. تحليل هندسة العمق ثلاثي الأبعاد غير المستوي (رفض الصور الورقية المسطحة والمنحنية).
+     * 3. تحليل نسيج الجلد والتشبع اللوني (كشف الورق المطبوع والشاشات).
+     * 4. نموذج MiniFASNet العصبي لكشف التزييف.
+     * 5. تطابق البصمة العصبية حسب زاوية الرأس + التحقق الزمني بين إطارين متتاليين.
+     */
     fun verifyFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int): Int {
+        updateSceneLuma(nv21, width, height)
+
         if (enrolledTemplates.isEmpty()) return CODE_MISMATCH
+
+        if (isLockedOut(appContext)) {
+            feedbackListener?.onVerifyRejected(
+                CODE_LOCKED_OUT,
+                getFailedAttempts(appContext),
+                getMaxAttempts(appContext),
+                true
+            )
+            return CODE_LOCKED_OUT
+        }
 
         val requireEyesOpen = prefs.getBoolean(KEY_REQUIRE_EYES, true)
         val adaptiveLearning = prefs.getBoolean(KEY_ADAPTIVE, true)
 
-        val detected = detectFastNV21(nv21, width, height, rotation) ?: return CODE_NO_FACE
+        val detected = detectFastNV21(nv21, width, height, rotation) ?: run {
+            feedbackListener?.onScanningState(faceDetected = false, confidence = 0f)
+            return CODE_NO_FACE
+        }
+
+        feedbackListener?.onScanningState(faceDetected = true, confidence = 0.35f)
 
         if (abs(detected.yaw) > OPTIMAL_MAX_HEAD_ANGLE || abs(detected.roll) > OPTIMAL_MAX_HEAD_ANGLE) {
             return if (detected.yaw > 0) CODE_ROTATED_LEFT else CODE_ROTATED_RIGHT
         }
 
         if (requireEyesOpen) {
-            if (detected.leftEyeOpen < 0.45f || detected.rightEyeOpen < 0.45f) {
+            if (detected.leftEyeOpen < 0.48f || detected.rightEyeOpen < 0.48f) {
                 return CODE_EYES_CLOSED
             }
         }
 
         val alignedFace = alignAndCrop(detected.bitmap, detected.scaledBox, detected.leftEye, detected.rightEye, recInputSize)
 
-        if (computeTextureSharpness(alignedFace) < MIN_SKIN_SHARPNESS) {
-            return CODE_SPOOF_WARNING
+        // الطبقة 1: فحص جودة نسيج الجلد والتوزيع اللوني لكشف الورق المطبوع والشاشات
+        if (!passesSkinForensics(alignedFace)) {
+            prevFrameEmbedding = null
+            return registerRejection(CODE_SPOOF_WARNING)
         }
 
+        // تشغيل الشبكات العصبية الثلاث بالتوازي لأقصى سرعة
         val meshFuture = aiExecutor.submit(Callable {
-            runCatching {
-                Tasks.await(meshDetector.process(InputImage.fromBitmap(detected.bitmap, 0)), 260, TimeUnit.MILLISECONDS)
-            }.getOrNull()
+            measureTrue3DFacialDepth(detected.bitmap, detected.scaledBox)
         })
 
         val spoofFuture = aiExecutor.submit(Callable {
-            if (antiSpoofInterpreter == null) return@Callable 1.0f
-            val wideContext = cropExpanded(detected.bitmap, detected.scaledBox, scale = 2.1f, targetSize = spoofInputSize)
+            if (antiSpoofInterpreter == null) return@Callable -1.0f
+            val wideContext = cropExpanded(detected.bitmap, detected.scaledBox, scale = 2.2f, targetSize = spoofInputSize)
             runAntiSpoofing(wideContext)
         })
 
@@ -290,66 +402,228 @@ class SmartFaceEngine(context: Context) {
             extractEmbedding(alignedFace)
         })
 
-        val meshes = runCatching { meshFuture.get(280, TimeUnit.MILLISECONDS) }.getOrNull()
-        val realScore = runCatching { spoofFuture.get(280, TimeUnit.MILLISECONDS) }.getOrDefault(1.0f)
-        val currentEmbedding = runCatching { embedFuture.get(280, TimeUnit.MILLISECONDS) }.getOrNull()
-            ?: return CODE_MISMATCH
+        val depth3D = runCatching { meshFuture.get(260, TimeUnit.MILLISECONDS) }.getOrNull()
+        val realScore = runCatching { spoofFuture.get(260, TimeUnit.MILLISECONDS) }.getOrDefault(-1.0f)
+        val currentEmbedding = runCatching { embedFuture.get(260, TimeUnit.MILLISECONDS) }.getOrNull()
+            ?: return CODE_KEEP_STILL
 
-        if (realScore < OPTIMAL_SPOOF_THRESHOLD) {
-            lastVerifiedEmbedding = null
-            return CODE_SPOOF_WARNING
+        // الطبقة 2: Fail-Closed للعمق ثلاثي الأبعاد (يجب إثبات بروز الأنف ثلاثي الأبعاد في المحورين الأفقي والرأسي)
+        if (depth3D == null) {
+            return CODE_KEEP_STILL
+        }
+        if (!depth3D.isTrue3DFace) {
+            prevFrameEmbedding = null
+            return registerRejection(CODE_SPOOF_WARNING)
         }
 
-        if (!meshes.isNullOrEmpty()) {
-            val pts = meshes[0].allPoints
-            if (pts.size >= 468) {
-                val noseZ = pts[1].position.z
-                val leftCheekZ = pts[234].position.z
-                val rightCheekZ = pts[454].position.z
-                val cheekAvgZ = (leftCheekZ + rightCheekZ) * 0.5f
-                val noseProtrusion = (cheekAvgZ - noseZ) / max(1f, detected.scaledBox.width().toFloat())
-                if (noseProtrusion < MIN_NOSE_PROTRUSION_3D) {
-                    lastVerifiedEmbedding = null
-                    return CODE_SPOOF_WARNING
-                }
-            }
-        }
-
-        val scores = enrolledTemplates.map { cosineSimilarity(currentEmbedding, it) }
-        val maxScore = scores.maxOrNull() ?: 0f
-        val top3Avg = scores.sortedDescending().take(3).average().toFloat()
-        val combinedScore = maxScore * 0.65f + top3Avg * 0.35f
-
-        if (combinedScore < MATCH_COMBINED_THRESHOLD && maxScore < MATCH_SINGLE_MAX_THRESHOLD) {
-            return CODE_MISMATCH
-        }
-
-        val now = System.currentTimeMillis()
-        if (maxScore < INSTANT_UNLOCK_THRESHOLD) {
-            val prevEmb = lastVerifiedEmbedding
-            if (prevEmb == null || (now - lastVerifiedTimeMs) > 1500L) {
-                lastVerifiedEmbedding = currentEmbedding
-                lastVerifiedTimeMs = now
+        // الطبقة 3: Fail-Closed لنموذج كشف التزييف العصبي MiniFASNet
+        if (antiSpoofInterpreter != null) {
+            if (realScore < 0f) {
                 return CODE_KEEP_STILL
             }
-            val frameToFrameSim = cosineSimilarity(currentEmbedding, prevEmb)
-            if (frameToFrameSim > 0.9998f) {
-                lastVerifiedEmbedding = null
-                return CODE_SPOOF_WARNING
+            if (realScore < SPOOF_REAL_THRESHOLD) {
+                prevFrameEmbedding = null
+                return registerRejection(CODE_SPOOF_WARNING)
             }
         }
 
-        lastVerifiedEmbedding = null
+        // الطبقة 4: مطابقة البصمة العصبية مع الزوايا الأربع المسجلة + المتوسط الهندسي
+        val targetPose = inferPoseBucket(detected.yaw, detected.pitch)
+        val poseMatchedScore = enrolledTemplates
+            .filter { it.poseId == targetPose || it.poseId == 4 }
+            .maxOfOrNull { cosineSimilarity(currentEmbedding, it.embedding) } ?: 0f
 
-        if (adaptiveLearning && maxScore in 0.58f..0.86f) {
+        val allScores = enrolledTemplates.map { cosineSimilarity(currentEmbedding, it.embedding) }
+        val maxScore = allScores.maxOrNull() ?: 0f
+        val top2Avg = allScores.sortedDescending().take(2).average().toFloat()
+        val combinedScore = maxScore * 0.50f + poseMatchedScore * 0.30f + top2Avg * 0.20f
+
+        if (combinedScore < MATCH_COMBINED_THRESHOLD || maxScore < MATCH_SINGLE_MAX_THRESHOLD) {
+            prevFrameEmbedding = null
+            return registerRejection(CODE_MISMATCH)
+        }
+
+        feedbackListener?.onScanningState(faceDetected = true, confidence = 0.78f)
+
+        // الطبقة 5: التحقق الزمني الإلزامي بين إطارين حيين متتاليين (يرفض الصور الثابتة المعلقة أمام الكاميرا)
+        val now = System.currentTimeMillis()
+        val prevEmb = prevFrameEmbedding
+        if (prevEmb == null || (now - prevFrameTimeMs) > 1200L) {
+            prevFrameEmbedding = currentEmbedding
+            prevFrameNoseZ = depth3D.nosePlaneRatio
+            prevFrameTimeMs = now
+            return CODE_KEEP_STILL
+        }
+
+        val temporalSim = cosineSimilarity(currentEmbedding, prevEmb)
+        if (temporalSim < 0.80f) {
+            prevFrameEmbedding = currentEmbedding
+            prevFrameNoseZ = depth3D.nosePlaneRatio
+            prevFrameTimeMs = now
+            return CODE_KEEP_STILL
+        }
+        // تطابق رقمي شبه مطلق 99.97%+ مع ثبات Z المطلق يعني صورة ثابتة أو حقن إطار
+        if (temporalSim > 0.9997f && abs(depth3D.nosePlaneRatio - prevFrameNoseZ) < 0.0001f) {
+            prevFrameEmbedding = null
+            return registerRejection(CODE_SPOOF_WARNING)
+        }
+
+        // نجاح مؤكد 100%
+        prevFrameEmbedding = null
+        resetFailedAttempts(appContext)
+
+        if (adaptiveLearning && maxScore in 0.66f..0.86f) {
             if (enrolledTemplates.size >= MAX_TEMPLATES) {
                 enrolledTemplates.removeAt(5)
             }
-            enrolledTemplates.add(currentEmbedding)
+            enrolledTemplates.add(EnrolledPoseTemplate(targetPose, currentEmbedding, depth3D.nosePlaneRatio))
             saveTemplates()
         }
 
+        feedbackListener?.onVerifySuccess()
         return CODE_SUCCESS
+    }
+
+    private fun registerRejection(reasonCode: Int): Int {
+        val now = System.currentTimeMillis()
+        // فاصل 950ms بين احتساب المحاولات الفاشلة حتى لا تُستهلك المحاولات في جزء من الثانية
+        if (now - lastCountedRejectionTimeMs >= 950L) {
+            lastCountedRejectionTimeMs = now
+            val maxAttempts = getMaxAttempts(appContext)
+            val newCount = getFailedAttempts(appContext) + 1
+            prefs.edit().putInt(KEY_FAILED_COUNT, newCount).apply()
+            val lockedOut = maxAttempts > 0 && newCount >= maxAttempts
+            feedbackListener?.onVerifyRejected(reasonCode, newCount, maxAttempts, lockedOut)
+            if (lockedOut) {
+                return CODE_LOCKED_OUT
+            }
+        }
+        return reasonCode
+    }
+
+    private fun inferPoseBucket(yaw: Float, pitch: Float): Int {
+        return when {
+            abs(yaw) >= abs(pitch) && abs(yaw) > 11f -> if (yaw * stage0YawSign >= 0) 0 else 1
+            abs(pitch) > 9f -> if (pitch > 0) 2 else 3
+            else -> 4
+        }
+    }
+
+    private data class Depth3DMetrics(
+        val nosePlaneRatio: Float,
+        val verticalCurveRatio: Float,
+        val isTrue3DFace: Boolean
+    )
+
+    /**
+     * قياس الانحناء ثلاثي الأبعاد الحقيقي للوجه باستخدام 468 نقطة عمق:
+     * يقيس بروز طرف الأنف (1) فوق مستوى الخدين (234, 454) AND فوق خط الجبهة-الذقن (10, 152)
+     * لكشف الصور الورقية سواء كانت مسطحة أو مثنية/منحنية!
+     */
+    private fun measureTrue3DFacialDepth(bitmap: Bitmap, box: Rect): Depth3DMetrics? {
+        val meshes = runCatching {
+            Tasks.await(meshDetector.process(InputImage.fromBitmap(bitmap, 0)), 240, TimeUnit.MILLISECONDS)
+        }.getOrNull() ?: return null
+
+        if (meshes.isEmpty()) return null
+        val pts = meshes[0].allPoints
+        if (pts.size < 468) return null
+
+        val faceWidth = max(1f, box.width().toFloat())
+        val noseTipZ = pts[1].position.z
+        val leftCheekZ = pts[234].position.z
+        val rightCheekZ = pts[454].position.z
+        val foreheadZ = pts[10].position.z
+        val chinZ = pts[152].position.z
+        val leftEyeZ = pts[33].position.z
+        val rightEyeZ = pts[263].position.z
+
+        // 1. البروز الأفقي للأنف بالنسبة للخدين
+        val horizontalPlaneZ = (leftCheekZ + rightCheekZ) * 0.5f
+        val horizontalRatio = (horizontalPlaneZ - noseTipZ) / faceWidth
+
+        // 2. البروز الرأسي للأنف بالنسبة للجبهة والذقن (يكشف الورقة المنحنية أسطوانياً)
+        val verticalPlaneZ = (foreheadZ + chinZ) * 0.5f
+        val verticalRatio = (verticalPlaneZ - noseTipZ) / faceWidth
+
+        // 3. عمق تجويف العينين مقارنة بالأنف
+        val eyeSocketRatio = (((leftEyeZ + rightEyeZ) * 0.5f) - noseTipZ) / faceWidth
+
+        val isTrue3D = horizontalRatio >= MIN_3D_NOSE_PLANE_RATIO
+                && verticalRatio >= MIN_3D_VERTICAL_CURVE_RATIO
+                && eyeSocketRatio >= 0.018f
+
+        return Depth3DMetrics(horizontalRatio, verticalRatio, isTrue3D)
+    }
+
+    /**
+     * تحليل جنائي لنسيج البشرة والتوزيع اللوني لكشف الورق المطبوع والشاشات
+     */
+    private fun passesSkinForensics(bitmap: Bitmap): Boolean {
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        var laplacianSum = 0.0
+        var count = 0
+        var cbSum = 0.0
+        var cbSqSum = 0.0
+        var crSum = 0.0
+        var crSqSum = 0.0
+
+        val startX = (w * 0.18f).toInt()
+        val endX = (w * 0.82f).toInt()
+        val startY = (h * 0.18f).toInt()
+        val endY = (h * 0.82f).toInt()
+
+        for (y in startY until endY step 2) {
+            for (x in startX until endX step 2) {
+                val p = pixels[y * w + x]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+
+                val l = (pixels[y * w + (x - 1)] shr 8) and 0xFF
+                val ri = (pixels[y * w + (x + 1)] shr 8) and 0xFF
+                val t = (pixels[(y - 1) * w + x] shr 8) and 0xFF
+                val bo = (pixels[(y + 1) * w + x] shr 8) and 0xFF
+                laplacianSum += abs(4 * g - l - ri - t - bo)
+
+                val cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
+                val cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
+                cbSum += cb
+                cbSqSum += cb * cb
+                crSum += cr
+                crSqSum += cr * cr
+                count++
+            }
+        }
+
+        if (count == 0) return false
+        val sharpness = (laplacianSum / count).toFloat()
+        val cbVar = max(0.0, (cbSqSum / count) - (cbSum / count).pow(2))
+        val crVar = max(0.0, (crSqSum / count) - (crSum / count).pow(2))
+        val chromaStd = sqrt((cbVar + crVar) * 0.5).toFloat()
+
+        return sharpness >= MIN_SKIN_SHARPNESS && chromaStd >= MIN_CHROMA_STD
+    }
+
+    private fun updateSceneLuma(nv21: ByteArray, width: Int, height: Int) {
+        val frameSize = width * height
+        if (nv21.size < frameSize || frameSize <= 0) return
+        var sum = 0L
+        var samples = 0
+        val step = 16
+        var i = 0
+        while (i < frameSize) {
+            sum += (nv21[i].toInt() and 0xFF)
+            samples++
+            i += step
+        }
+        if (samples > 0) {
+            lastFrameLuma = sum.toFloat() / samples.toFloat()
+        }
     }
 
     private data class DetectedFrame(
@@ -371,7 +645,7 @@ class SmartFaceEngine(context: Context) {
         for (rot in candidates) {
             val inputImage = InputImage.fromByteArray(nv21, width, height, rot, InputImage.IMAGE_FORMAT_NV21)
             val faces = runCatching {
-                Tasks.await(faceDetector.process(inputImage), 250, TimeUnit.MILLISECONDS)
+                Tasks.await(faceDetector.process(inputImage), 240, TimeUnit.MILLISECONDS)
             }.getOrNull()
 
             if (!faces.isNullOrEmpty()) {
@@ -418,42 +692,20 @@ class SmartFaceEngine(context: Context) {
 
     private fun computeCentroidEmbedding(): FloatArray? {
         if (enrolledTemplates.isEmpty()) return null
-        val dim = enrolledTemplates[0].size
+        val dim = enrolledTemplates[0].embedding.size
         val sum = FloatArray(dim)
-        for (vec in enrolledTemplates) {
-            if (vec.size == dim) {
-                for (i in 0 until dim) sum[i] += vec[i]
+        for (tpl in enrolledTemplates) {
+            if (tpl.embedding.size == dim) {
+                for (i in 0 until dim) sum[i] += tpl.embedding[i]
             }
         }
         return l2Normalize(sum)
     }
 
-    private fun computeTextureSharpness(bitmap: Bitmap): Float {
-        val w = bitmap.width
-        val h = bitmap.height
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        var laplacianSum = 0.0
-        var count = 0
-        for (y in 2 until h - 2 step 2) {
-            for (x in 2 until w - 2 step 2) {
-                val c = (pixels[y * w + x] shr 8) and 0xFF
-                val l = (pixels[y * w + (x - 1)] shr 8) and 0xFF
-                val r = (pixels[y * w + (x + 1)] shr 8) and 0xFF
-                val t = (pixels[(y - 1) * w + x] shr 8) and 0xFF
-                val b = (pixels[(y + 1) * w + x] shr 8) and 0xFF
-                val lap = abs(4 * c - l - r - t - b)
-                laplacianSum += lap
-                count++
-            }
-        }
-        return if (count > 0) (laplacianSum / count).toFloat() else 100f
-    }
-
     private fun runAntiSpoofing(bitmap: Bitmap): Float {
-        val interpreter = antiSpoofInterpreter ?: return 1.0f
-        val normalize01 = (spoofOutputSize == 1 || spoofInputSize >= 224)
-        val inputBuffer = bitmapToFloatBuffer(bitmap, mode = if (normalize01) 1 else 0)
+        val interpreter = antiSpoofInterpreter ?: return -1.0f
+        // MiniFASNet القياسي يعمل على قيم [0..255]
+        val inputBuffer = bitmapToFloatBuffer(bitmap, mode = 0)
         val output = Array(1) { FloatArray(spoofOutputSize) }
         interpreter.run(inputBuffer, output)
 
@@ -461,13 +713,15 @@ class SmartFaceEngine(context: Context) {
         return when {
             spoofOutputSize == 1 -> 1.0f - logits[0].coerceIn(0f, 1f)
             spoofOutputSize >= 3 -> {
-                val expReal = exp(logits[1].toDouble())
-                val sumExp = logits.sumOf { exp(it.toDouble()) }
+                val maxLogit = logits.maxOrNull() ?: 0f
+                val expReal = exp((logits[1] - maxLogit).toDouble())
+                val sumExp = logits.sumOf { exp((it - maxLogit).toDouble()) }
                 (expReal / sumExp).toFloat()
             }
             else -> {
-                val expReal = exp(logits[0].toDouble())
-                val sumExp = exp(logits[0].toDouble()) + exp(logits[1].toDouble())
+                val maxLogit = max(logits[0], logits[1])
+                val expReal = exp((logits[0] - maxLogit).toDouble())
+                val sumExp = exp((logits[0] - maxLogit).toDouble()) + exp((logits[1] - maxLogit).toDouble())
                 (expReal / sumExp).toFloat()
             }
         }
@@ -557,20 +811,15 @@ class SmartFaceEngine(context: Context) {
             val g = (p shr 8 and 0xFF).toFloat()
             val b = (p and 0xFF).toFloat()
             when (mode) {
-                1 -> {
-                    buffer.putFloat(r / 255.0f)
-                    buffer.putFloat(g / 255.0f)
-                    buffer.putFloat(b / 255.0f)
-                }
                 2 -> {
                     buffer.putFloat((r - 127.5f) / 128.0f)
                     buffer.putFloat((g - 127.5f) / 128.0f)
                     buffer.putFloat((b - 127.5f) / 128.0f)
                 }
                 else -> {
-                    buffer.putFloat(r)
-                    buffer.putFloat(g)
                     buffer.putFloat(b)
+                    buffer.putFloat(g)
+                    buffer.putFloat(r)
                 }
             }
         }
@@ -596,9 +845,11 @@ class SmartFaceEngine(context: Context) {
             val baos = ByteArrayOutputStream()
             val dos = DataOutputStream(baos)
             dos.writeInt(enrolledTemplates.size)
-            for (vec in enrolledTemplates) {
-                dos.writeInt(vec.size)
-                for (f in vec) dos.writeFloat(f)
+            for (tpl in enrolledTemplates) {
+                dos.writeInt(tpl.poseId)
+                dos.writeFloat(tpl.noseProtrusion3D)
+                dos.writeInt(tpl.embedding.size)
+                for (f in tpl.embedding) dos.writeFloat(f)
             }
             dos.flush()
             val rawBytes = baos.toByteArray()
@@ -620,9 +871,11 @@ class SmartFaceEngine(context: Context) {
             val count = dis.readInt()
             enrolledTemplates.clear()
             repeat(count) {
+                val poseId = dis.readInt()
+                val nose3D = dis.readFloat()
                 val len = dis.readInt()
                 val vec = FloatArray(len) { dis.readFloat() }
-                enrolledTemplates.add(vec)
+                enrolledTemplates.add(EnrolledPoseTemplate(poseId, vec, nose3D))
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load templates", e)

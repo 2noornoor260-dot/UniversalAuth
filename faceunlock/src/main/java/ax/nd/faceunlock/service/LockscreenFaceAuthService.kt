@@ -15,8 +15,9 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
-import android.media.AudioManager
-import android.media.ToneGenerator
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -28,7 +29,6 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
-import android.view.animation.PathInterpolator
 import androidx.core.content.getSystemService
 import ax.nd.faceunlock.FaceApplication
 import ax.nd.faceunlock.LibManager
@@ -40,12 +40,17 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlin.math.*
 
-class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbacks, SensorEventListener {
+class LockscreenFaceAuthService :
+    AccessibilityService(),
+    FaceAuthServiceCallbacks,
+    SensorEventListener,
+    SmartFaceEngine.VerificationFeedbackListener {
 
     private var windowManager: WindowManager? = null
 
-    // 1. لوحة الإضاءة البيضاء الناعمة الشفافة (تظهر وترتفع إضاءتها بسلاسة في الظلام الدامس فقط)
+    // 1. لوحة الإضاءة البيضاء الناعمة (تتحقق من مستشعر الضوء + سطوع الكاميرا الفعلي معاً لمنع تشغيلها في النور نهائياً)
     private var fillLightView: NightFillLightPanelView? = null
     private var fillLightAdded: Boolean = false
     private var fillLightAnimator: ValueAnimator? = null
@@ -63,8 +68,8 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         screenBrightness = -1.0f
     }
 
-    // 2. نتوء قطرة الماء (Waterdrop Notch) بلون أسود AMOLED ينسحب من حافة الكاميرا في كل الاتجاهات
-    private var notchView: WaterdropCameraNotchView? = null
+    // 2. كبسولة قطرة الماء الفيزيائية النابضة بالحياة
+    private var notchView: LivingAppleNotchView? = null
     private var notchAdded: Boolean = false
     private val notchParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -93,7 +98,8 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private var handler: Handler? = null
 
     private var showStartTimeMs: Long = 0L
-    private var darkReadingsCount: Int = 0
+    private var lastLuxValue: Float = -1f
+    private var genuineDarkTicks: Int = 0
 
     private lateinit var serviceJob: Job
     private lateinit var serviceScope: CoroutineScope
@@ -114,6 +120,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
         prefs = FaceApplication.getApp().prefs
         controller = FaceAuthServiceController(this, prefs, this)
+        SmartFaceEngine.setFeedbackListener(this)
 
         windowManager = getSystemService()
         keyguardManager = getSystemService()
@@ -143,6 +150,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
                             reconfigureUnlockHook()
                         }
                         prefs.failedUnlockAttempts.set(0)
+                        SmartFaceEngine.resetFailedAttempts(this@LockscreenFaceAuthService)
                         forceImmediateCleanup()
                     }
                     Intent.ACTION_SCREEN_OFF -> {
@@ -223,6 +231,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
     override fun onDestroy() {
         super.onDestroy()
+        SmartFaceEngine.setFeedbackListener(null)
         unregisterLockStateReceiver()
         unregisterUnlockReceiver()
         forceImmediateCleanup()
@@ -246,13 +255,6 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
-    /**
-     * تحديد الحافة التي تقع بها الكاميرا الأمامية في Galaxy Tab A7 (SM-T505N) حسب دوران الشاشة:
-     * - ROTATION_0 (طولي): الحافة اليمنى (Gravity.RIGHT)
-     * - ROTATION_90 (أفقي): الحافة العلوية (Gravity.TOP)
-     * - ROTATION_180 (طولي مقلوب): الحافة اليسرى (Gravity.LEFT)
-     * - ROTATION_270 (أفقي مقلوب): الحافة السفلية (Gravity.BOTTOM)
-     */
     private fun getCameraEdgeForRotation(rotation: Int): CameraEdge {
         return when (rotation) {
             Surface.ROTATION_90 -> CameraEdge.TOP
@@ -266,9 +268,17 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         if (active) return
         if (!Util.isFaceUnlockEnrolled(this)) return
 
+        // إذا تم تجاوز الحد الأقصى للمحاولات الفاشلة، لا تفتح الكاميرا حتى إدخال رمز الدخول
+        if (SmartFaceEngine.isLockedOut(this)) {
+            showLockedOutNotchBriefly()
+            return
+        }
+
         active = true
         showStartTimeMs = System.currentTimeMillis()
-        darkReadingsCount = 0
+        lastLuxValue = -1f
+        genuineDarkTicks = 0
+        SmartFaceEngine.lastFrameLuma = 128f
 
         lightSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
@@ -280,9 +290,18 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
 
         handler?.removeCallbacks(autoTimeoutRunnable)
-        handler?.postDelayed(autoTimeoutRunnable, 4500L)
+        handler?.postDelayed(autoTimeoutRunnable, 5200L)
 
         controller?.start()
+    }
+
+    private fun showLockedOutNotchBriefly() {
+        val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        if (!smartPrefs.getBoolean(SmartFaceEngine.KEY_CAPSULE_ANIM, true)) return
+        showWaterdropNotch()
+        notchView?.triggerLockedRejectShake(finalLockout = true) {
+            removeNotchOverlay()
+        }
     }
 
     private fun hide(animated: Boolean) {
@@ -328,11 +347,11 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             notchParams.x = 0
             notchParams.y = 0
 
-            val view = WaterdropCameraNotchView(this, edge)
+            val view = LivingAppleNotchView(this, edge)
             notchView = view
             windowManager?.addView(view, notchParams)
             notchAdded = true
-            view.pullFromBezel()
+            view.pullFromBezelSpring()
         } catch (_: Exception) {
         }
     }
@@ -340,7 +359,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private fun removeNotchOverlay() {
         if (notchAdded) {
             try {
-                notchView?.stopAnimators()
+                notchView?.stopAllPhysics()
                 windowManager?.removeView(notchView)
             } catch (_: Exception) {
             }
@@ -349,28 +368,25 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
-    /**
-     * لوحة بيضاء ناعمة شفافة ترتفع إضاءتها وسطوع الشاشة بسلاسة في الظلام الدامس فقط
-     */
     private fun showSmoothNightFillLight() {
         if (fillLightAdded) return
         try {
             val view = NightFillLightPanelView(this)
             fillLightView = view
-            fillLightParams.screenBrightness = 0.05f
+            fillLightParams.screenBrightness = 0.06f
             view.alpha = 0f
             windowManager?.addView(view, fillLightParams)
             fillLightAdded = true
 
             fillLightAnimator?.cancel()
             fillLightAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 420L
+                duration = 450L
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { anim ->
                     val t = anim.animatedValue as Float
                     if (fillLightAdded && fillLightView != null) {
-                        fillLightView?.alpha = t * 0.86f
-                        fillLightParams.screenBrightness = 0.05f + (0.87f * t)
+                        fillLightView?.alpha = t * 0.84f
+                        fillLightParams.screenBrightness = 0.06f + (0.86f * t)
                         try {
                             windowManager?.updateViewLayout(fillLightView, fillLightParams)
                         } catch (_: Exception) {
@@ -388,8 +404,8 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         if (!fillLightAdded) return
 
         if (animated && fillLightView != null) {
-            val startAlpha = fillLightView?.alpha ?: 0.86f
-            val startBright = fillLightParams.screenBrightness.coerceAtLeast(0.05f)
+            val startAlpha = fillLightView?.alpha ?: 0.84f
+            val startBright = fillLightParams.screenBrightness.coerceAtLeast(0.06f)
             fillLightAnimator = ValueAnimator.ofFloat(1f, 0f).apply {
                 duration = 240L
                 addUpdateListener { anim ->
@@ -427,25 +443,35 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
+    /**
+     * التحقق المزدوج من الظلام الفعلي:
+     * 1. مستشعر الضوء المحيط < 3.0 lux بعد استقراره (260ms)
+     * 2. سطوع إطارات الكاميرا الفعلي (lastFrameLuma < 52f)
+     * إذا كانت الكاميرا ترى إضاءة طبيعية (> 65f) فلن تعمل اللوحة البيضاء أبداً!
+     */
     override fun onSensorChanged(event: SensorEvent?) {
         if (!active || event?.sensor?.type != Sensor.TYPE_LIGHT) return
-
-        // تجاهل أول 160ms من استقرار المستشعر لمنع أي قراءة صفرية كاذبة في الغرفة المضيئة
-        if (System.currentTimeMillis() - showStartTimeMs < 160L) return
-
         val lux = event.values.firstOrNull() ?: 100f
+        lastLuxValue = lux
+
+        if (System.currentTimeMillis() - showStartTimeMs < 260L) return
+
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, true)
+        val cameraSeesDarkness = SmartFaceEngine.lastFrameLuma < 52f
+        val cameraSeesBrightRoom = SmartFaceEngine.lastFrameLuma > 68f
 
-        if (nightLightEnabled && lux < 8.0f) {
-            darkReadingsCount++
-            // تأكيد قراءتين متتاليتين في الظلام الفعلي قبل تشغيل اللوحة البيضاء الناعمة
-            if (darkReadingsCount >= 2) {
+        if (cameraSeesBrightRoom || !nightLightEnabled || lux >= 3.2f) {
+            genuineDarkTicks = 0
+            hideFillLightPanel(animated = true)
+            return
+        }
+
+        if (lux < 3.2f && cameraSeesDarkness) {
+            genuineDarkTicks++
+            if (genuineDarkTicks >= 2) {
                 showSmoothNightFillLight()
             }
-        } else {
-            darkReadingsCount = 0
-            hideFillLightPanel(animated = true)
         }
     }
 
@@ -458,15 +484,42 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     override fun onInterrupt() {
     }
 
+    override fun onScanningState(faceDetected: Boolean, confidence: Float) {
+        handler?.post {
+            notchView?.setScanningEngagement(faceDetected, confidence)
+        }
+    }
+
+    override fun onVerifySuccess() {
+        // يتم التعامل معه في onAuthed()
+    }
+
+    override fun onVerifyRejected(reasonCode: Int, attemptsUsed: Int, maxAttempts: Int, lockedOut: Boolean) {
+        handler?.post {
+            if (lockedOut) {
+                handler?.removeCallbacks(autoTimeoutRunnable)
+                sensorManager?.unregisterListener(this)
+                hideFillLightPanel(animated = true)
+                if (active) {
+                    active = false
+                    controller?.stop()
+                }
+                if (notchAdded && notchView != null) {
+                    notchView?.triggerLockedRejectShake(finalLockout = true) {
+                        removeNotchOverlay()
+                    }
+                }
+            } else {
+                notchView?.triggerLockedRejectShake(finalLockout = false, onDone = null)
+            }
+        }
+    }
+
     override fun onAuthed() {
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-        if (smartPrefs.getBoolean(SmartFaceEngine.KEY_UNLOCK_CHIME, false)) {
-            try {
-                val tone = ToneGenerator(AudioManager.STREAM_SYSTEM, 40)
-                tone.startTone(ToneGenerator.TONE_PROP_ACK, 45)
-                handler?.postDelayed({ tone.release() }, 120)
-            } catch (_: Exception) {
-            }
+        val chimeType = smartPrefs.getString(SmartFaceEngine.KEY_UNLOCK_CHIME_TYPE, "apple_glass") ?: "apple_glass"
+        if (chimeType != "none") {
+            AppleAcousticChimePlayer.play(chimeType)
         }
 
         val unlockAnimation = when (prefs.unlockAnimation.get()) {
@@ -486,7 +539,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             active = false
 
             if (notchAdded && notchView != null) {
-                notchView?.showSuccessAndRetract {
+                notchView?.morphToUnlockedPadlockAndRetract {
                     removeNotchOverlay()
                 }
             } else {
@@ -506,7 +559,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     /**
-     * لوحة إضاءة بيضاء ناعمة شفافة قليلاً تضيء الوجه بنعومة في الظلام الدامس فقط
+     * لوحة إضاءة بيضاء ناعمة متدرجة تضيء الوجه بنعومة في الظلام الدامس فقط
      */
     private class NightFillLightPanelView(ctx: Context) : View(ctx) {
         private val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -517,15 +570,14 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             val h = height.toFloat()
             val cx = w * 0.5f
             val cy = h * 0.5f
-            val radius = maxOf(w, h) * 0.78f
+            val radius = maxOf(w, h) * 0.80f
 
-            // لوحة بيضاء ناعمة متجانسة بشفافية خفيفة في المركز وسطوع أعلى نحو الأطراف لإضاءة الوجه بوضوح
             panelPaint.shader = RadialGradient(
                 cx, cy, radius,
                 intArrayOf(
-                    Color.argb(155, 250, 252, 255),
-                    Color.argb(205, 255, 255, 255),
-                    Color.argb(235, 255, 255, 255)
+                    Color.argb(145, 252, 253, 255),
+                    Color.argb(200, 255, 255, 255),
+                    Color.argb(232, 255, 255, 255)
                 ),
                 floatArrayOf(0.0f, 0.55f, 1.0f),
                 Shader.TileMode.CLAMP
@@ -535,92 +587,175 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     }
 
     /**
-     * نتوء قطرة الماء (Waterdrop Notch) بلون أسود AMOLED (#000000) ينسحب بسلاسة من حافة الكاميرا
-     * ويتكيف ما بداخله مع دوران الشاشة الأربعة حتى لا يكون معكوساً أبداً
+     * كبسولة آبل الفيزيائية النابضة بالحياة (LivingAppleNotchView):
+     * - حركة خروج وانكماش بزنبرك فيزيائي مرن (Under-damped Spring Physics)
+     * - نبض حي وتنفس طبيعي للوجه والعيون داخل الكبسولة أثناء البحث
+     * - تحوّل فيزيائي سلس من رمز Face ID إلى قفل مفتوح يتأرجح ذراعه للأعلى عند النجاح
+     * - تحوّل فيزيائي إلى قفل أحمر مغلق مع اهتزاز زنبركي أفقي عند الرفض
      */
-    private class WaterdropCameraNotchView(ctx: Context, private val edge: CameraEdge) : View(ctx) {
+    private class LivingAppleNotchView(ctx: Context, private val edge: CameraEdge) : View(ctx) {
         private val density = ctx.resources.displayMetrics.density
-        private val spanPx = (146f * density).toInt()
-        private val maxDepthPx = (40f * density).toInt()
+        private val baseSpanPx = (164f * density).toInt()
+        private val baseDepthPx = (46f * density).toInt()
 
         private val amoledBlackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.BLACK
             style = Paint.Style.FILL
         }
-        private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        private val rimGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1.4f * density
+        }
+        private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#0A84FF")
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
-            strokeWidth = 2.0f * density
+            strokeWidth = 2.15f * density
         }
-        private val beamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#880A84FF")
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeWidth = 1.6f * density
+        private val lockBodyFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
         }
 
         private val notchPath = Path()
-        private var pullProgress = 0f
-        private var scanPhase = 0f
-        private var isSuccess = false
-        private var successProgress = 0f
-        private var scanAnimator: ValueAnimator? = null
-        private var pullAnimator: ValueAnimator? = null
+
+        // متغيرات الفيزياء الزنبركية
+        private var springPull = 0f          // 0 -> 1.08 -> 1.0
+        private var pulseBreath = 0f         // نبض حي مستمر
+        private var morphToLock = 0f         // 0 = Face ID, 1 = Padlock
+        private var shackleOpenProgress = 0f // 0 = مغلق, 1 = مفتوح ومرتفع
+        private var rejectShakeOffset = 0f   // اهتزاز الرفض الفيزيائي
+        private var faceEngaged = false
+        private var isUnlockedState = false
+        private var isRejectedState = false
+
+        private var breathAnimator: ValueAnimator? = null
+        private var springAnimator: ValueAnimator? = null
+        private var morphAnimator: ValueAnimator? = null
+        private var shakeAnimator: ValueAnimator? = null
 
         init {
-            startScanLoop()
+            startOrganicBreathing()
         }
 
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
             if (edge == CameraEdge.TOP || edge == CameraEdge.BOTTOM) {
-                setMeasuredDimension(spanPx, maxDepthPx)
+                setMeasuredDimension(baseSpanPx, baseDepthPx)
             } else {
-                setMeasuredDimension(maxDepthPx, spanPx)
+                setMeasuredDimension(baseDepthPx, baseSpanPx)
             }
         }
 
-        private fun startScanLoop() {
-            scanAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 1050L
+        private fun startOrganicBreathing() {
+            breathAnimator = ValueAnimator.ofFloat(0f, (2.0 * PI).toFloat()).apply {
+                duration = 2100L
                 repeatCount = ValueAnimator.INFINITE
-                repeatMode = ValueAnimator.REVERSE
                 interpolator = LinearInterpolator()
                 addUpdateListener {
-                    scanPhase = it.animatedValue as Float
+                    pulseBreath = it.animatedValue as Float
                     invalidate()
                 }
                 start()
             }
         }
 
-        fun pullFromBezel() {
-            pullAnimator?.cancel()
-            pullAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 340L
-                interpolator = PathInterpolator(0.22f, 1.0f, 0.36f, 1.0f)
-                addUpdateListener {
-                    pullProgress = it.animatedValue as Float
+        fun setScanningEngagement(engaged: Boolean, confidence: Float) {
+            if (isUnlockedState || isRejectedState) return
+            this.faceEngaged = engaged
+            invalidate()
+        }
+
+        /**
+         * زنبرك فيزيائي مرن لسحب الكبسولة من حافة الكاميرا مع ارتداد طبيعي ناعم
+         */
+        fun pullFromBezelSpring() {
+            springAnimator?.cancel()
+            springAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 520L
+                interpolator = LinearInterpolator()
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    // معادلة زنبرك متخامد: 1 - e^(-6.5t) * cos(11t)
+                    springPull = (1.0 - exp(-6.5 * t) * cos(11.0 * t)).toFloat().coerceAtLeast(0f)
                     invalidate()
                 }
                 start()
             }
         }
 
-        fun showSuccessAndRetract(onDone: () -> Unit) {
-            scanAnimator?.cancel()
-            isSuccess = true
-            iconPaint.color = Color.parseColor("#30D158")
-            ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 170L
-                addUpdateListener {
-                    successProgress = it.animatedValue as Float
+        /**
+         * التحول الفيزيائي الحي عند نجاح التحقق: Face ID -> قفل أخضر يُفتح ذراعه بمرونة
+         */
+        fun morphToUnlockedPadlockAndRetract(onDone: () -> Unit) {
+            if (isUnlockedState) return
+            isUnlockedState = true
+            isRejectedState = false
+            shakeAnimator?.cancel()
+            rejectShakeOffset = 0f
+
+            morphAnimator?.cancel()
+            morphAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 560L
+                interpolator = LinearInterpolator()
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    // المرحلة الأولى (0 -> 0.45): تحول زوايا الوجه إلى جسم القفل
+                    morphToLock = (t / 0.45f).coerceIn(0f, 1f)
+                    // المرحلة الثانية (0.30 -> 1.0): ارتفاع ذراع القفل مع ارتداد زنبركي حي
+                    val st = ((t - 0.30f) / 0.70f).coerceIn(0f, 1f)
+                    shackleOpenProgress = if (st <= 0f) 0f else (1.0 - exp(-6.0 * st) * cos(10.0 * st)).toFloat()
                     invalidate()
                 }
                 addListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) {
-                        postDelayed({ retractIntoBezel(onDone) }, 140L)
+                        postDelayed({ retractIntoBezel(onDone) }, 220L)
+                    }
+                })
+                start()
+            }
+        }
+
+        /**
+         * التحول الفيزيائي الحي عند الرفض: Face ID -> قفل أحمر مغلق يهتز بفيزياء الزنبرك
+         */
+        fun triggerLockedRejectShake(finalLockout: Boolean, onDone: (() -> Unit)?) {
+            if (isUnlockedState) return
+            isRejectedState = true
+            shackleOpenProgress = 0f
+
+            shakeAnimator?.cancel()
+            shakeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 620L
+                interpolator = LinearInterpolator()
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    morphToLock = (t / 0.25f).coerceIn(0f, 1f)
+                    // اهتزاز أفقي متخامد يحاكي اهتزاز قفل iOS
+                    val decay = exp(-4.8 * t).toFloat()
+                    rejectShakeOffset = sin(t * 28.0).toFloat() * decay * (7.5f * density)
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        rejectShakeOffset = 0f
+                        if (finalLockout) {
+                            postDelayed({ retractIntoBezel { onDone?.invoke() } }, 280L)
+                        } else {
+                            // العودة السلسة لحالة البحث
+                            ValueAnimator.ofFloat(1f, 0f).apply {
+                                duration = 260L
+                                addUpdateListener {
+                                    morphToLock = it.animatedValue as Float
+                                    invalidate()
+                                }
+                                addListener(object : AnimatorListenerAdapter() {
+                                    override fun onAnimationEnd(animation: Animator) {
+                                        isRejectedState = false
+                                    }
+                                })
+                                start()
+                            }
+                        }
                     }
                 })
                 start()
@@ -628,13 +763,16 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
 
         fun retractIntoBezel(onDone: () -> Unit) {
-            scanAnimator?.cancel()
-            pullAnimator?.cancel()
-            pullAnimator = ValueAnimator.ofFloat(pullProgress, 0f).apply {
-                duration = 230L
-                interpolator = PathInterpolator(0.4f, 0f, 1f, 1f)
+            breathAnimator?.cancel()
+            springAnimator?.cancel()
+            morphAnimator?.cancel()
+            shakeAnimator?.cancel()
+            val startPull = springPull
+            springAnimator = ValueAnimator.ofFloat(1f, 0f).apply {
+                duration = 250L
+                interpolator = DecelerateInterpolator(1.6f)
                 addUpdateListener {
-                    pullProgress = it.animatedValue as Float
+                    springPull = startPull * (it.animatedValue as Float)
                     invalidate()
                 }
                 addListener(object : AnimatorListenerAdapter() {
@@ -646,19 +784,37 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             }
         }
 
-        fun stopAnimators() {
-            scanAnimator?.cancel()
-            pullAnimator?.cancel()
+        fun stopAllPhysics() {
+            breathAnimator?.cancel()
+            springAnimator?.cancel()
+            morphAnimator?.cancel()
+            shakeAnimator?.cancel()
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            if (pullProgress <= 0.01f) return
+            if (springPull <= 0.01f) return
 
             val w = width.toFloat()
             val h = height.toFloat()
-            val depth = maxDepthPx * pullProgress
-            val spanScale = 0.62f + 0.38f * pullProgress
+
+            // نبضة تنفس حية تجعل الكبسولة تتفاعل بمرونة مع حالة المسح والفتح والرفض
+            val breathWave = sin(pulseBreath).toFloat()
+            val engageBoost = if (faceEngaged) 1.04f else 1.0f
+            val unlockBoost = if (isUnlockedState) (1.0f + 0.06f * sin(morphToLock * PI).toFloat()) else 1.0f
+            val liveScale = (1.0f + 0.022f * breathWave) * engageBoost * unlockBoost
+
+            val maxAllowedDepth = (if (edge == CameraEdge.TOP || edge == CameraEdge.BOTTOM) h else w) * 0.90f
+            val depth = (maxAllowedDepth * 0.88f * springPull * liveScale).coerceAtMost(maxAllowedDepth)
+            val spanScale = (0.60f + 0.36f * springPull) * liveScale
+
+            // تحديد اللون التفاعلي الحي
+            val accentColor = when {
+                isUnlockedState -> Color.parseColor("#30D158")
+                isRejectedState -> Color.parseColor("#FF453A")
+                faceEngaged -> Color.parseColor("#3898FF")
+                else -> Color.parseColor("#0A84FF")
+            }
 
             notchPath.reset()
             var iconCx = w * 0.5f
@@ -666,152 +822,274 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
             when (edge) {
                 CameraEdge.TOP -> {
-                    val halfSpan = (w * spanScale) * 0.5f
-                    val startX = w * 0.5f - halfSpan
-                    val endX = w * 0.5f + halfSpan
+                    val centerX = w * 0.5f + rejectShakeOffset
+                    val halfSpan = (w * spanScale) * 0.46f
+                    val startX = centerX - halfSpan
+                    val endX = centerX + halfSpan
                     val spanW = endX - startX
                     notchPath.moveTo(startX, 0f)
-                    notchPath.cubicTo(
-                        startX + spanW * 0.22f, 0f,
-                        startX + spanW * 0.27f, depth,
-                        w * 0.5f, depth
-                    )
-                    notchPath.cubicTo(
-                        endX - spanW * 0.27f, depth,
-                        endX - spanW * 0.22f, 0f,
-                        endX, 0f
-                    )
+                    notchPath.cubicTo(startX + spanW * 0.22f, 0f, startX + spanW * 0.26f, depth, centerX, depth)
+                    notchPath.cubicTo(endX - spanW * 0.26f, depth, endX - spanW * 0.22f, 0f, endX, 0f)
                     notchPath.close()
-                    iconCx = w * 0.5f
+                    iconCx = centerX
                     iconCy = depth * 0.48f
                 }
-
                 CameraEdge.BOTTOM -> {
-                    val halfSpan = (w * spanScale) * 0.5f
-                    val startX = w * 0.5f - halfSpan
-                    val endX = w * 0.5f + halfSpan
+                    val centerX = w * 0.5f + rejectShakeOffset
+                    val halfSpan = (w * spanScale) * 0.46f
+                    val startX = centerX - halfSpan
+                    val endX = centerX + halfSpan
                     val spanW = endX - startX
                     val apexY = h - depth
                     notchPath.moveTo(startX, h)
-                    notchPath.cubicTo(
-                        startX + spanW * 0.22f, h,
-                        startX + spanW * 0.27f, apexY,
-                        w * 0.5f, apexY
-                    )
-                    notchPath.cubicTo(
-                        endX - spanW * 0.27f, apexY,
-                        endX - spanW * 0.22f, h,
-                        endX, h
-                    )
+                    notchPath.cubicTo(startX + spanW * 0.22f, h, startX + spanW * 0.26f, apexY, centerX, apexY)
+                    notchPath.cubicTo(endX - spanW * 0.26f, apexY, endX - spanW * 0.22f, h, endX, h)
                     notchPath.close()
-                    iconCx = w * 0.5f
+                    iconCx = centerX
                     iconCy = h - depth * 0.48f
                 }
-
                 CameraEdge.RIGHT -> {
-                    val halfSpan = (h * spanScale) * 0.5f
-                    val startY = h * 0.5f - halfSpan
-                    val endY = h * 0.5f + halfSpan
+                    val centerY = h * 0.5f + rejectShakeOffset
+                    val halfSpan = (h * spanScale) * 0.46f
+                    val startY = centerY - halfSpan
+                    val endY = centerY + halfSpan
                     val spanH = endY - startY
                     val apexX = w - depth
                     notchPath.moveTo(w, startY)
-                    notchPath.cubicTo(
-                        w, startY + spanH * 0.22f,
-                        apexX, startY + spanH * 0.27f,
-                        apexX, h * 0.5f
-                    )
-                    notchPath.cubicTo(
-                        apexX, endY - spanH * 0.27f,
-                        w, endY - spanH * 0.22f,
-                        w, endY
-                    )
+                    notchPath.cubicTo(w, startY + spanH * 0.22f, apexX, startY + spanH * 0.26f, apexX, centerY)
+                    notchPath.cubicTo(apexX, endY - spanH * 0.26f, w, endY - spanH * 0.22f, w, endY)
                     notchPath.close()
                     iconCx = w - depth * 0.48f
-                    iconCy = h * 0.5f
+                    iconCy = centerY
                 }
-
                 CameraEdge.LEFT -> {
-                    val halfSpan = (h * spanScale) * 0.5f
-                    val startY = h * 0.5f - halfSpan
-                    val endY = h * 0.5f + halfSpan
+                    val centerY = h * 0.5f + rejectShakeOffset
+                    val halfSpan = (h * spanScale) * 0.46f
+                    val startY = centerY - halfSpan
+                    val endY = centerY + halfSpan
                     val spanH = endY - startY
                     notchPath.moveTo(0f, startY)
-                    notchPath.cubicTo(
-                        0f, startY + spanH * 0.22f,
-                        depth, startY + spanH * 0.27f,
-                        depth, h * 0.5f
-                    )
-                    notchPath.cubicTo(
-                        depth, endY - spanH * 0.27f,
-                        0f, endY - spanH * 0.22f,
-                        0f, endY
-                    )
+                    notchPath.cubicTo(0f, startY + spanH * 0.22f, depth, startY + spanH * 0.26f, depth, centerY)
+                    notchPath.cubicTo(depth, endY - spanH * 0.26f, 0f, endY - spanH * 0.22f, 0f, endY)
                     notchPath.close()
                     iconCx = depth * 0.48f
-                    iconCy = h * 0.5f
+                    iconCy = centerY
                 }
             }
 
-            // رسم النتوء باللون الأسود AMOLED الخالص (#000000) بدون أي إطار خارجي ليلتحم بحواف الشاشة
+            // جسم النتوء بلون أسود AMOLED خالص (#000000)
             canvas.drawPath(notchPath, amoledBlackPaint)
 
-            // رسم أيقونة Face ID داخل النتوء دائماً بوضع مستقيم يتكيف مع اتجاه الشاشة الحالي
-            if (pullProgress > 0.45f) {
-                val contentAlpha = (((pullProgress - 0.45f) / 0.55f) * 255f).toInt().coerceIn(0, 255)
-                iconPaint.alpha = contentAlpha
-                beamPaint.alpha = (contentAlpha * 0.65f).toInt()
+            // توهج حافة زجاجي خفيف جداً يتنفس مع نبض الكبسولة
+            val rimAlpha = ((38 + 24 * breathWave) * springPull.coerceIn(0f, 1f)).toInt().coerceIn(0, 90)
+            rimGlowPaint.color = Color.argb(rimAlpha, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+            canvas.drawPath(notchPath, rimGlowPaint)
 
-                val iconSize = 18.5f * density
-                val iconLeft = iconCx - iconSize * 0.5f
-                val iconTop = iconCy - iconSize * 0.5f
-
-                if (isSuccess) {
-                    val p = Path().apply {
-                        moveTo(iconLeft + iconSize * 0.18f, iconTop + iconSize * 0.52f)
-                        lineTo(iconLeft + iconSize * 0.42f, iconTop + iconSize * 0.76f)
-                        if (successProgress > 0.4f) {
-                            val t = ((successProgress - 0.4f) / 0.6f).coerceIn(0f, 1f)
-                            lineTo(
-                                iconLeft + iconSize * (0.42f + 0.42f * t),
-                                iconTop + iconSize * (0.76f - 0.50f * t)
-                            )
-                        }
-                    }
-                    canvas.drawPath(p, iconPaint)
-                } else {
-                    drawMiniFaceId(canvas, iconLeft, iconTop, iconSize)
-                    val beamY = iconTop + iconSize * (0.15f + 0.70f * scanPhase)
-                    canvas.drawLine(iconLeft + 2f * density, beamY, iconLeft + iconSize - 2f * density, beamY, beamPaint)
-                }
+            if (springPull > 0.35f) {
+                val contentAlpha = (((springPull - 0.35f) / 0.65f) * 255f).toInt().coerceIn(0, 255)
+                drawLivingMorphingGlyph(canvas, iconCx, iconCy, 20f * density, accentColor, contentAlpha, breathWave)
             }
         }
 
-        private fun drawMiniFaceId(canvas: Canvas, l: Float, t: Float, s: Float) {
-            val arm = s * 0.25f
-            val r = s * 0.16f
-            val right = l + s
-            val bottom = t + s
+        /**
+         * رسم وتحويل رمز Face ID فيزيائياً إلى قفل حي (مفتوح أو مغلق)
+         */
+        private fun drawLivingMorphingGlyph(
+            canvas: Canvas,
+            cx: Float,
+            cy: Float,
+            size: Float,
+            color: Int,
+            alpha: Int,
+            breathWave: Float
+        ) {
+            glyphPaint.color = color
+            glyphPaint.alpha = alpha
 
-            canvas.drawArc(RectF(l, t, l + 2 * r, t + 2 * r), 180f, 90f, false, iconPaint)
-            canvas.drawLine(l + r, t, l + arm, t, iconPaint)
-            canvas.drawLine(l, t + r, l, t + arm, iconPaint)
+            val m = morphToLock.coerceIn(0f, 1f)
 
-            canvas.drawArc(RectF(right - 2 * r, t, right, t + 2 * r), 270f, 90f, false, iconPaint)
-            canvas.drawLine(right - arm, t, right - r, t, iconPaint)
-            canvas.drawLine(right, t + r, right, t + arm, iconPaint)
+            // 1. رسم رمز Face ID الحي (يتلاشى وينكمش بسلاسة عند التحول للقفل)
+            if (m < 0.98f) {
+                val faceAlpha = ((1f - m) * alpha).toInt().coerceIn(0, 255)
+                glyphPaint.alpha = faceAlpha
+                val s = size * (1f - 0.18f * m + 0.03f * breathWave)
+                val l = cx - s * 0.5f
+                val t = cy - s * 0.5f
+                val r = l + s
+                val b = t + s
+                val arm = s * 0.26f
+                val cr = s * 0.17f
 
-            canvas.drawArc(RectF(l, bottom - 2 * r, l + 2 * r, bottom), 90f, 90f, false, iconPaint)
-            canvas.drawLine(l + r, bottom, l + arm, bottom, iconPaint)
-            canvas.drawLine(l, bottom - arm, l, bottom - r, iconPaint)
+                // الزوايا الأربع المرنة
+                canvas.drawArc(RectF(l, t, l + 2 * cr, t + 2 * cr), 180f, 90f, false, glyphPaint)
+                canvas.drawLine(l + cr, t, l + arm, t, glyphPaint)
+                canvas.drawLine(l, t + cr, l, t + arm, glyphPaint)
 
-            canvas.drawArc(RectF(right - 2 * r, bottom - 2 * r, right, bottom), 0f, 90f, false, iconPaint)
-            canvas.drawLine(right - arm, bottom, right - r, bottom, iconPaint)
-            canvas.drawLine(right, bottom - arm, right, bottom - r, iconPaint)
+                canvas.drawArc(RectF(r - 2 * cr, t, r, t + 2 * cr), 270f, 90f, false, glyphPaint)
+                canvas.drawLine(r - arm, t, r - cr, t, glyphPaint)
+                canvas.drawLine(r, t + cr, r, t + arm, glyphPaint)
 
-            val eyeY = t + s * 0.40f
-            canvas.drawLine(l + s * 0.35f, eyeY - s * 0.05f, l + s * 0.35f, eyeY + s * 0.05f, iconPaint)
-            canvas.drawLine(l + s * 0.65f, eyeY - s * 0.05f, l + s * 0.65f, eyeY + s * 0.05f, iconPaint)
-            canvas.drawArc(RectF(l + s * 0.36f, t + s * 0.48f, l + s * 0.64f, t + s * 0.68f), 25f, 130f, false, iconPaint)
+                canvas.drawArc(RectF(l, b - 2 * cr, l + 2 * cr, b), 90f, 90f, false, glyphPaint)
+                canvas.drawLine(l + cr, b, l + arm, b, glyphPaint)
+                canvas.drawLine(l, b - arm, l, b - cr, glyphPaint)
+
+                canvas.drawArc(RectF(r - 2 * cr, b - 2 * cr, r, b), 0f, 90f, false, glyphPaint)
+                canvas.drawLine(r - arm, b, r - cr, b, glyphPaint)
+                canvas.drawLine(r, b - arm, r, b - cr, glyphPaint)
+
+                // تعبير الوجه الحي (حركة نظر خفيفة ورمشة عين طبيعية)
+                val lookShiftX = sin(pulseBreath * 0.7f).toFloat() * (s * 0.045f)
+                val lookShiftY = cos(pulseBreath * 0.5f).toFloat() * (s * 0.03f)
+                val blinkTrigger = sin(pulseBreath * 1.5f).toFloat()
+                val eyeHalfH = if (blinkTrigger > 0.94f) s * 0.01f else s * 0.055f
+
+                val eyeY = t + s * 0.40f + lookShiftY
+                canvas.drawLine(l + s * 0.35f + lookShiftX, eyeY - eyeHalfH, l + s * 0.35f + lookShiftX, eyeY + eyeHalfH, glyphPaint)
+                canvas.drawLine(l + s * 0.65f + lookShiftX, eyeY - eyeHalfH, l + s * 0.65f + lookShiftX, eyeY + eyeHalfH, glyphPaint)
+
+                // ابتسامة حية تتفاعل عند اقتراب التعرف
+                val smileSweep = if (faceEngaged) 145f else 120f
+                val smileStart = 90f - smileSweep * 0.5f
+                canvas.drawArc(
+                    RectF(l + s * 0.35f + lookShiftX, t + s * 0.47f + lookShiftY, l + s * 0.65f + lookShiftX, t + s * 0.68f + lookShiftY),
+                    smileStart, smileSweep, false, glyphPaint
+                )
+            }
+
+            // 2. رسم القفل الفيزيائي الحي (يظهر بسلاسة ويفتح ذراعه بمرونة زنبركية أو يهتز مغلقاً)
+            if (m > 0.02f) {
+                val lockAlpha = (m * alpha).toInt().coerceIn(0, 255)
+                val lockScale = 0.72f + 0.28f * m
+                val bw = size * 0.66f * lockScale
+                val bh = size * 0.50f * lockScale
+                val bodyTop = cy - bh * 0.15f
+                val bodyRect = RectF(cx - bw * 0.5f, bodyTop, cx + bw * 0.5f, bodyTop + bh)
+
+                // جسم القفل الممتلئ
+                lockBodyFillPaint.color = color
+                lockBodyFillPaint.alpha = lockAlpha
+                canvas.drawRoundRect(bodyRect, 3.2f * density, 3.2f * density, lockBodyFillPaint)
+
+                // ثقب المفتاح بلون أسود AMOLED
+                lockBodyFillPaint.color = Color.BLACK
+                lockBodyFillPaint.alpha = lockAlpha
+                canvas.drawCircle(cx, bodyTop + bh * 0.46f, 1.45f * density * lockScale, lockBodyFillPaint)
+
+                // ذراع القفل العلوي (Shackle) يتحرك ويرتفع ويتأرجح عند الفتح!
+                glyphPaint.color = color
+                glyphPaint.alpha = lockAlpha
+                val shackleR = bw * 0.31f
+                val liftY = shackleOpenProgress * (bh * 0.46f)
+                val swingDeg = -shackleOpenProgress * 26f
+
+                canvas.save()
+                // محور الدوران عند الطرف الأيمن لذراع القفل
+                val pivotX = cx + shackleR
+                val pivotY = bodyTop - liftY
+                canvas.rotate(swingDeg, pivotX, pivotY)
+
+                val shacklePath = Path().apply {
+                    moveTo(cx - shackleR, bodyTop + 1f * density - liftY * 0.35f)
+                    lineTo(cx - shackleR, bodyTop - shackleR * 0.85f - liftY)
+                    arcTo(
+                        RectF(
+                            cx - shackleR,
+                            bodyTop - shackleR * 1.85f - liftY,
+                            cx + shackleR,
+                            bodyTop + shackleR * 0.15f - liftY
+                        ),
+                        180f, 180f, false
+                    )
+                    lineTo(cx + shackleR, bodyTop + 1f * density - liftY)
+                }
+                canvas.drawPath(shacklePath, glyphPaint)
+                canvas.restore()
+            }
+        }
+    }
+
+    /**
+     * مولّد نغمات آبل الصوتية المثقولة (Synthesized Polyphonic Harmonic Chimes)
+     */
+    object AppleAcousticChimePlayer {
+        fun play(type: String) {
+            Thread {
+                try {
+                    val sampleRate = 44100
+                    val durationSec = when (type) {
+                        "crystal" -> 0.22
+                        "titanium" -> 0.26
+                        "silk" -> 0.42
+                        else -> 0.36 // apple_glass
+                    }
+                    val numSamples = (sampleRate * durationSec).toInt()
+                    val pcm = ShortArray(numSamples)
+
+                    for (i in 0 until numSamples) {
+                        val t = i.toDouble() / sampleRate.toDouble()
+                        val sample = when (type) {
+                            "crystal" -> {
+                                // نقرة كريستال عميقة ودافئة (C5 + G5 + Sub-octave)
+                                val env = exp(-t * 22.0) * min(1.0, t / 0.004)
+                                (0.45 * sin(2.0 * PI * 523.25 * t)
+                                        + 0.30 * sin(2.0 * PI * 783.99 * t)
+                                        + 0.25 * sin(2.0 * PI * 261.63 * t)) * env
+                            }
+                            "titanium" -> {
+                                // تأكيد معدني مثقول (A4 -> E5 سريع مع أساس عميق)
+                                val env1 = exp(-t * 26.0) * min(1.0, t / 0.003)
+                                val t2 = (t - 0.055).coerceAtLeast(0.0)
+                                val env2 = if (t >= 0.055) exp(-t2 * 18.0) * min(1.0, t2 / 0.004) else 0.0
+                                (0.40 * sin(2.0 * PI * 440.0 * t) * env1
+                                        + 0.45 * sin(2.0 * PI * 659.25 * t2) * env2
+                                        + 0.20 * sin(2.0 * PI * 220.0 * t) * env1)
+                            }
+                            "silk" -> {
+                                // وتر مخملي ناعم (D5 + F#5 + A5)
+                                val env = exp(-t * 9.5) * min(1.0, t / 0.015)
+                                (0.38 * sin(2.0 * PI * 587.33 * t)
+                                        + 0.32 * sin(2.0 * PI * 739.99 * t)
+                                        + 0.30 * sin(2.0 * PI * 880.00 * t)) * env
+                            }
+                            else -> {
+                                // رنين آبل الزجاجي الكلاسيكي (F5 -> C6)
+                                val env1 = exp(-t * 14.0) * min(1.0, t / 0.006)
+                                val t2 = (t - 0.085).coerceAtLeast(0.0)
+                                val env2 = if (t >= 0.085) exp(-t2 * 11.0) * min(1.0, t2 / 0.006) else 0.0
+                                (0.42 * sin(2.0 * PI * 698.46 * t) * env1
+                                        + 0.16 * sin(2.0 * PI * 1396.91 * t) * env1
+                                        + 0.48 * sin(2.0 * PI * 1046.50 * t2) * env2
+                                        + 0.14 * sin(2.0 * PI * 523.25 * t2) * env2)
+                            }
+                        }
+                        pcm[i] = (sample.coerceIn(-1.0, 1.0) * 18000.0).toInt().toShort()
+                    }
+
+                    val track = AudioTrack.Builder()
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                .build()
+                        )
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(pcm.size * 2)
+                        .setTransferMode(AudioTrack.MODE_STATIC)
+                        .build()
+
+                    track.write(pcm, 0, pcm.size)
+                    track.play()
+                    Thread.sleep((durationSec * 1000).toLong() + 80L)
+                    track.release()
+                } catch (_: Exception) {
+                }
+            }.start()
         }
     }
 
