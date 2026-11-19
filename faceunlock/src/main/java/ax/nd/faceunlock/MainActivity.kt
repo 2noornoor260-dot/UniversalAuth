@@ -6,7 +6,10 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -20,12 +23,12 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.widget.NestedScrollView
-import androidx.fragment.app.FragmentContainerView
 import ax.nd.faceunlock.backend.SmartFaceEngine
-import ax.nd.faceunlock.pref.SettingsFragment
+import ax.nd.faceunlock.pref.Prefs
 import ax.nd.faceunlock.service.LockscreenFaceAuthService
 import ax.nd.faceunlock.service.RemoveFaceController
 import ax.nd.faceunlock.service.RemoveFaceControllerCallbacks
@@ -37,7 +40,8 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
     private var removeFaceController: RemoveFaceController? = null
     private var requestUnlockPermsLauncher: ActivityResultLauncher<String>? = null
-    private lateinit var prefs: SharedPreferences
+    private lateinit var smartPrefs: SharedPreferences
+    private lateinit var sysPrefs: Prefs
     private lateinit var themedCtx: Context
 
     private lateinit var statusDot: View
@@ -45,7 +49,9 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     private lateinit var statusSubtitle: TextView
     private lateinit var accessRowText: TextView
     private lateinit var enrollRowText: TextView
+    private lateinit var testRowText: TextView
     private lateinit var removeRowText: TextView
+    private lateinit var animValueText: TextView
 
     private var isDarkTheme = false
     private var appleBlue = 0
@@ -64,12 +70,12 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         } else {
             com.google.android.material.R.style.Theme_MaterialComponents_Light_NoActionBar
         }
-        theme.applyStyle(baseTheme, false)
-        theme.applyStyle(androidx.preference.R.style.PreferenceThemeOverlay, true)
+        theme.applyStyle(baseTheme, true)
         super.onCreate(savedInstanceState)
 
         themedCtx = ContextThemeWrapper(this, baseTheme)
-        prefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        sysPrefs = FaceApplication.getApp().prefs
         requestUnlockPermsLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
         initApplePalette()
@@ -79,7 +85,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         }
 
-        buildAppleSettingsScreen(savedInstanceState)
+        buildAppleSettingsScreen()
         checkAndAskForPermissions()
     }
 
@@ -105,7 +111,7 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         }
     }
 
-    private fun buildAppleSettingsScreen(savedInstanceState: Bundle?) {
+    private fun buildAppleSettingsScreen() {
         val scroll = NestedScrollView(themedCtx).apply {
             setBackgroundColor(pageBgColor)
             isFillViewport = true
@@ -114,20 +120,37 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
         val root = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(22), dp(16), dp(36))
+            setPadding(dp(16), dp(24), dp(16), dp(40))
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
 
-        // عنوان كبير بأسلوب إعدادات آبل
-        root.addView(TextView(themedCtx).apply {
+        // ترويسة Apple Face ID مع أيقونة مرسومة بدقة
+        val headerBox = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(16), dp(6), dp(16), dp(22))
+        }
+        val glyphView = FaceIdEmblemView(themedCtx, appleBlue).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+        }
+        headerBox.addView(glyphView)
+        headerBox.addView(TextView(themedCtx).apply {
             text = "التعرّف على الوجه"
-            textSize = 30f
+            textSize = 26f
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             setTextColor(textPrimary)
-            setPadding(dp(4), 0, dp(4), dp(18))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(4))
         })
+        headerBox.addView(TextView(themedCtx).apply {
+            text = "فتح القفل السريع والحماية ثلاثية الأبعاد"
+            textSize = 14f
+            setTextColor(textSecondary)
+            gravity = Gravity.CENTER
+        })
+        root.addView(headerBox)
 
-        // المجموعة 1: حالة النظام وخدمة القفل
+        // المجموعة 1: حالة التعرّف وخدمة شاشة القفل
         val statusGroup = createInsetGroup()
         val statusRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -158,19 +181,18 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         statusRow.addView(statusDot)
         statusRow.addView(statusTexts)
         statusGroup.addView(statusRow)
-
         statusGroup.addView(createHairlineDivider())
 
         val accessRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(13), dp(16), dp(13))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
         accessRowText = TextView(themedCtx).apply {
-            textSize = 15f
+            textSize = 15.5f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         val chevron = TextView(themedCtx).apply {
@@ -183,10 +205,11 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         statusGroup.addView(accessRow)
         root.addView(statusGroup)
 
-        // المجموعة 2: إدارة الوجه (صفوف نصية أنيقة مثل آبل)
+        // المجموعة 2: إدارة الوجه والاختبار الفوري
         val faceActionsGroup = createInsetGroup()
+
         enrollRowText = TextView(themedCtx).apply {
-            text = "إعداد مظهر جديد للوجه"
+            text = "إعداد التعرّف على الوجه"
             textSize = 16f
             setTextColor(appleBlue)
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -195,6 +218,19 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             }
         }
         faceActionsGroup.addView(enrollRowText)
+        faceActionsGroup.addView(createHairlineDivider())
+
+        // إعادة ميزة اختبار القفل الأصلية بتصميم متناسق
+        testRowText = TextView(themedCtx).apply {
+            text = "اختبار التعرّف على الوجه"
+            textSize = 16f
+            setTextColor(appleBlue)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, FaceAuthActivity::class.java))
+            }
+        }
+        faceActionsGroup.addView(testRowText)
         faceActionsGroup.addView(createHairlineDivider())
 
         removeRowText = TextView(themedCtx).apply {
@@ -206,11 +242,11 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         faceActionsGroup.addView(removeRowText)
         root.addView(faceActionsGroup)
 
-        // المجموعة 3: الذكاء والانتباه وتجربة الاستخدام
-        root.addView(createSectionLabel("الانتباه وتجربة الاستخدام"))
+        // المجموعة 3: الذكاء والانتباه (مستوحاة من Apple Face ID و Samsung)
+        root.addView(createSectionLabel("الانتباه والذكاء التكيفي"))
         val smartGroup = createInsetGroup()
 
-        smartGroup.addView(createAppleToggleRow(
+        smartGroup.addView(createSmartToggleRow(
             title = "طلب الانتباه عند الفتح",
             subtitle = "التحقق من فتح العينين والنظر إلى الشاشة",
             key = SmartFaceEngine.KEY_REQUIRE_EYES,
@@ -218,31 +254,23 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         ))
         smartGroup.addView(createHairlineDivider())
 
-        smartGroup.addView(createAppleToggleRow(
+        smartGroup.addView(createSmartToggleRow(
             title = "التعلّم التكيفي المستمر",
-            subtitle = "تحديث البصمة تلقائياً مع تغيّر الإضاءة والمظهر",
+            subtitle = "تحديث البصمة تلقائياً مع تغيّر الإضاءة والنظارات",
             key = SmartFaceEngine.KEY_ADAPTIVE,
             defaultVal = true
         ))
         smartGroup.addView(createHairlineDivider())
 
-        smartGroup.addView(createAppleToggleRow(
-            title = "إضاءة ذكية في الظلام الدامس",
+        smartGroup.addView(createSmartToggleRow(
+            title = "إضاءة الشاشة في الظلام الدامس",
             subtitle = "رفع السطوع تلقائياً فقط عندما تكون الغرفة مظلمة",
             key = SmartFaceEngine.KEY_NIGHT_LIGHT,
             defaultVal = false
         ))
         smartGroup.addView(createHairlineDivider())
 
-        smartGroup.addView(createAppleToggleRow(
-            title = "إظهار حالة المسح على شاشة القفل",
-            subtitle = "عرض نص صغير أعلى الشاشة أثناء التعرّف",
-            key = SmartFaceEngine.KEY_SHOW_LOCK_STATUS,
-            defaultVal = false
-        ))
-        smartGroup.addView(createHairlineDivider())
-
-        smartGroup.addView(createAppleToggleRow(
+        smartGroup.addView(createSmartToggleRow(
             title = "نغمة تأكيد خفيفة عند الفتح",
             subtitle = "إصدار صوت نظام خفيف عند نجاح التعرّف",
             key = SmartFaceEngine.KEY_UNLOCK_CHIME,
@@ -250,38 +278,106 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         ))
         root.addView(smartGroup)
 
+        // المجموعة 4: سلوك شاشة القفل والأمان (بديل أنيق للإعدادات القديمة)
+        root.addView(createSectionLabel("سلوك شاشة القفل والأمان"))
+        val lockBehaviorGroup = createInsetGroup()
+
+        lockBehaviorGroup.addView(createSysToggleRow(
+            title = "تخطي شاشة القفل مباشرة",
+            subtitle = "الانتقال للشاشة الرئيسية فوراً أو البقاء لقراءة الإشعارات",
+            initialVal = sysPrefs.bypassKeyguard.get(),
+            onChanged = { sysPrefs.bypassKeyguard.set(it) }
+        ))
+        lockBehaviorGroup.addView(createHairlineDivider())
+
+        lockBehaviorGroup.addView(createSysToggleRow(
+            title = "التعرّف السريع عند إيقاظ الشاشة",
+            subtitle = "بدء المسح فور الضغط على زر التشغيل قبل ظهور القفل",
+            initialVal = sysPrefs.earlyUnlockHook.get(),
+            onChanged = { sysPrefs.earlyUnlockHook.set(it) }
+        ))
+        lockBehaviorGroup.addView(createHairlineDivider())
+
+        lockBehaviorGroup.addView(createSysToggleRow(
+            title = "طلب رمز الدخول بعد إعادة التشغيل",
+            subtitle = "تعزيز الأمان بعد إقلاع الجهاز لأول مرة",
+            initialVal = sysPrefs.requirePinOnBoot.get(),
+            onChanged = { sysPrefs.requirePinOnBoot.set(it) }
+        ))
+        lockBehaviorGroup.addView(createHairlineDivider())
+
+        lockBehaviorGroup.addView(createSysToggleRow(
+            title = "إظهار شريط الحالة أعلى القفل",
+            subtitle = "عرض رسالة صغيرة أثناء التحقق من الوجه",
+            initialVal = sysPrefs.showStatusText.get(),
+            onChanged = { sysPrefs.showStatusText.set(it) }
+        ))
+        lockBehaviorGroup.addView(createHairlineDivider())
+
+        // صف اختيار حركة فتح القفل
+        val animRow = LinearLayout(themedCtx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            setOnClickListener { showUnlockAnimationPicker() }
+        }
+        animRow.addView(TextView(themedCtx).apply {
+            text = "حركة فتح القفل"
+            textSize = 15.5f
+            setTextColor(textPrimary)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        animValueText = TextView(themedCtx).apply {
+            text = getAnimLabel(sysPrefs.unlockAnimation.get())
+            textSize = 14.5f
+            setTextColor(textSecondary)
+            setPadding(0, 0, dp(6), 0)
+        }
+        animRow.addView(animValueText)
+        animRow.addView(TextView(themedCtx).apply {
+            text = "‹"
+            textSize = 20f
+            setTextColor(textSecondary)
+        })
+        lockBehaviorGroup.addView(animRow)
+        root.addView(lockBehaviorGroup)
+
         root.addView(createSectionFootnote(
             "الحماية ثلاثية الأبعاد وكشف التزييف العصبي مفعّلان تلقائياً في الخلفية لمنع الفتح عبر الصور أو الشاشات."
         ))
 
-        // المجموعة 4: إعدادات شاشة القفل والنظام
-        root.addView(createSectionLabel("إعدادات شاشة القفل"))
-        val systemGroup = createInsetGroup()
-        val settingsContainer = FragmentContainerView(this).apply {
-            id = View.generateViewId()
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            setPadding(dp(4), dp(4), dp(4), dp(4))
-        }
-        systemGroup.addView(settingsContainer)
-        root.addView(systemGroup)
-
         scroll.addView(root)
         setContentView(scroll)
+    }
 
-        if (savedInstanceState == null) {
-            supportFragmentManager.beginTransaction()
-                .replace(settingsContainer.id, SettingsFragment())
-                .commitNowAllowingStateLoss()
+    private fun getAnimLabel(mode: String?): String {
+        return when (mode) {
+            "mode_wake_and_unlock" -> "إيقاظ وفتح فوري"
+            "mode_wake_and_unlock_pulsing" -> "إيقاظ مع نبض"
+            else -> "تلاشي ناعم"
         }
+    }
+
+    private fun showUnlockAnimationPicker() {
+        val labels = arrayOf("تلاشي ناعم", "إيقاظ وفتح فوري", "إيقاظ مع نبض")
+        val values = arrayOf("mode_unlock_fading", "mode_wake_and_unlock", "mode_wake_and_unlock_pulsing")
+        val currentIdx = values.indexOf(sysPrefs.unlockAnimation.get()).coerceAtLeast(0)
+
+        AlertDialog.Builder(themedCtx)
+            .setTitle("حركة فتح القفل")
+            .setSingleChoiceItems(labels, currentIdx) { dialog, which ->
+                sysPrefs.unlockAnimation.set(values[which])
+                animValueText.text = labels[which]
+                dialog.dismiss()
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
     }
 
     private fun createInsetGroup(): LinearLayout {
         val bg = GradientDrawable().apply {
             setColor(cardBgColor)
-            cornerRadius = dp(13).toFloat()
+            cornerRadius = dp(14).toFloat()
             setStroke(1, dividerColor)
         }
         return LinearLayout(themedCtx).apply {
@@ -323,11 +419,31 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         }
     }
 
-    private fun createAppleToggleRow(
+    private fun createSmartToggleRow(
         title: String,
         subtitle: String,
         key: String,
         defaultVal: Boolean
+    ): LinearLayout {
+        return buildToggleRowView(title, subtitle, smartPrefs.getBoolean(key, defaultVal)) { isChecked ->
+            smartPrefs.edit().putBoolean(key, isChecked).apply()
+        }
+    }
+
+    private fun createSysToggleRow(
+        title: String,
+        subtitle: String,
+        initialVal: Boolean,
+        onChanged: (Boolean) -> Unit
+    ): LinearLayout {
+        return buildToggleRowView(title, subtitle, initialVal, onChanged)
+    }
+
+    private fun buildToggleRowView(
+        title: String,
+        subtitle: String,
+        checked: Boolean,
+        onChanged: (Boolean) -> Unit
     ): LinearLayout {
         val row = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -360,12 +476,10 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         val thumbStates = ColorStateList.valueOf(Color.WHITE)
 
         val switchView = SwitchMaterial(themedCtx).apply {
-            isChecked = prefs.getBoolean(key, defaultVal)
+            isChecked = checked
             trackTintList = trackStates
             thumbTintList = thumbStates
-            setOnCheckedChangeListener { _, isChecked ->
-                prefs.edit().putBoolean(key, isChecked).apply()
-            }
+            setOnCheckedChangeListener { _, isChecked -> onChanged(isChecked) }
         }
 
         row.addView(textCol)
@@ -408,13 +522,32 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             statusTitle.text = "التعرّف على الوجه مُفعّل"
             statusSubtitle.text = "البصمة ثلاثية الأبعاد مشفّرة ومحفوظة بأمان"
             enrollRowText.text = "إعادة إعداد مظهر الوجه"
+
+            testRowText.alpha = 1.0f
+            testRowText.isEnabled = true
+            testRowText.setOnClickListener {
+                startActivity(Intent(this@MainActivity, FaceAuthActivity::class.java))
+            }
+
             removeRowText.alpha = 1.0f
             removeRowText.isEnabled = true
-            removeRowText.setOnClickListener { removeFace(faceId) }
+            removeRowText.setOnClickListener {
+                AlertDialog.Builder(themedCtx)
+                    .setTitle("إعادة تعيين بيانات الوجه")
+                    .setMessage("هل تريد حذف بصمة الوجه المسجلة؟")
+                    .setPositiveButton("حذف") { _, _ -> removeFace(faceId) }
+                    .setNegativeButton("إلغاء", null)
+                    .show()
+            }
         } else {
             statusTitle.text = "لم يتم إعداد الوجه بعد"
             statusSubtitle.text = "ابدأ المسح من 5 زوايا لتفعيل فتح القفل بالوجه"
             enrollRowText.text = "إعداد التعرّف على الوجه"
+
+            testRowText.alpha = 0.4f
+            testRowText.isEnabled = false
+            testRowText.setOnClickListener(null)
+
             removeRowText.alpha = 0.4f
             removeRowText.isEnabled = false
             removeRowText.setOnClickListener(null)
@@ -462,6 +595,55 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         runOnUiThread {
             Toast.makeText(this, "تعذّر الحذف: $message", Toast.LENGTH_LONG).show()
             releaseRemoveFaceController()
+        }
+    }
+
+    /**
+     * أيقونة Apple Face ID مرسومة بدقة متجهية
+     */
+    private class FaceIdEmblemView(ctx: Context, color: Int) : View(ctx) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            strokeWidth = 3.2f * ctx.resources.displayMetrics.density
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val pad = paint.strokeWidth
+            val arm = w * 0.22f
+            val r = w * 0.16f
+
+            // زوايا إطار Face ID الأربع
+            canvas.drawArc(RectF(pad, pad, pad + 2 * r, pad + 2 * r), 180f, 90f, false, paint)
+            canvas.drawLine(pad + r, pad, pad + arm, pad, paint)
+            canvas.drawLine(pad, pad + r, pad, pad + arm, paint)
+
+            canvas.drawArc(RectF(w - pad - 2 * r, pad, w - pad, pad + 2 * r), 270f, 90f, false, paint)
+            canvas.drawLine(w - pad - arm, pad, w - pad - r, pad, paint)
+            canvas.drawLine(w - pad, pad + r, w - pad, pad + arm, paint)
+
+            canvas.drawArc(RectF(pad, h - pad - 2 * r, pad + 2 * r, h - pad), 90f, 90f, false, paint)
+            canvas.drawLine(pad + r, h - pad, pad + arm, h - pad, paint)
+            canvas.drawLine(pad, h - pad - arm, pad, h - pad - r, paint)
+
+            canvas.drawArc(RectF(w - pad - 2 * r, h - pad - 2 * r, w - pad, h - pad), 0f, 90f, false, paint)
+            canvas.drawLine(w - pad - arm, h - pad, w - pad - r, h - pad, paint)
+            canvas.drawLine(w - pad, h - pad - arm, w - pad, h - pad - r, paint)
+
+            // العينان والأنف والابتسامة
+            val eyeY = h * 0.40f
+            canvas.drawLine(w * 0.35f, eyeY - h * 0.04f, w * 0.35f, eyeY + h * 0.04f, paint)
+            canvas.drawLine(w * 0.65f, eyeY - h * 0.04f, w * 0.65f, eyeY + h * 0.04f, paint)
+
+            canvas.drawLine(w * 0.50f, h * 0.42f, w * 0.50f, h * 0.55f, paint)
+            canvas.drawLine(w * 0.46f, h * 0.55f, w * 0.50f, h * 0.55f, paint)
+
+            canvas.drawArc(RectF(w * 0.36f, h * 0.48f, w * 0.64f, h * 0.68f), 25f, 130f, false, paint)
         }
     }
 }

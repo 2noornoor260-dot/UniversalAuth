@@ -63,12 +63,13 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private var displayManager: DisplayManager? = null
     private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
-    private var lastAmbientLux: Float = 100f // افتراض الإضاءة الجيدة حتى يثبت العكس
+    private var lastAmbientLux: Float = 100f
     private var handler: Handler? = null
 
     private lateinit var serviceJob: Job
     private lateinit var serviceScope: CoroutineScope
     private lateinit var prefs: Prefs
+    private var showStatusText = false
     private var booted = false
 
     private val autoTimeoutRunnable = Runnable {
@@ -96,7 +97,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         textView = TextView(this).apply {
             setTextColor(Color.WHITE)
             setShadowLayer(8f, 0f, 0f, Color.BLACK)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             setPadding(0, 14.dpToPx.toInt(), 0, 0)
             textAlignment = TextView.TEXT_ALIGNMENT_CENTER
         }
@@ -106,6 +107,12 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             reconfigureUnlockHook()
         }
         setupUnlockReceiver()
+
+        serviceScope.launch {
+            prefs.showStatusText.asFlow().collect { show ->
+                showStatusText = show
+            }
+        }
     }
 
     private fun setupUnlockReceiver() {
@@ -217,16 +224,12 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
                     sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
                 }
 
-                val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-                val showLockText = smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)
-
                 params.screenBrightness = -1.0f
-                if (showLockText) {
+                if (showStatusText) {
                     textView?.text = "جاري التحقق من الوجه..."
                     addOrUpdateOverlay()
                 }
 
-                // إيقاف تلقائي بعد 4.5 ثانية لتوفير البطارية إذا لم ينظر أحد للشاشة
                 handler?.removeCallbacks(autoTimeoutRunnable)
                 handler?.postDelayed(autoTimeoutRunnable, 4500L)
 
@@ -274,16 +277,15 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
 
-        // رفع السطوع فقط إذا كان الخيار مفعلاً والغرفة مظلمة فعلياً (أقل من 12 لوكس)
-        if (nightLightEnabled && lastAmbientLux < 12f) {
+        if (nightLightEnabled && lastAmbientLux < 10f) {
             if (params.screenBrightness != 0.72f) {
                 params.screenBrightness = 0.72f
-                textView?.text = ""
+                if (!showStatusText) textView?.text = ""
                 addOrUpdateOverlay()
             }
         } else if (params.screenBrightness > 0f) {
             params.screenBrightness = -1.0f
-            if (!smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)) {
+            if (!showStatusText) {
                 removeTextViewFromWindowManager()
             } else {
                 addOrUpdateOverlay()
@@ -311,7 +313,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             }
         }
 
-        val unlockAnimation = when (FaceApplication.getApp().prefs.unlockAnimation.get()) {
+        val unlockAnimation = when (prefs.unlockAnimation.get()) {
             "mode_wake_and_unlock" -> XposedConstants.MODE_WAKE_AND_UNLOCK
             "mode_wake_and_unlock_pulsing" -> XposedConstants.MODE_WAKE_AND_UNLOCK_PULSING
             else -> XposedConstants.MODE_UNLOCK_FADING
@@ -327,8 +329,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
     override fun onError(errId: Int, message: String) {
         handler?.post {
-            val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-            if (smartPrefs.getBoolean(SmartFaceEngine.KEY_SHOW_LOCK_STATUS, false)) {
+            if (showStatusText) {
                 textView?.text = message
                 handler?.postDelayed({ hide() }, 1000)
             } else {
