@@ -124,7 +124,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
 
-        // ترويسة Apple Face ID مع أيقونة مرسومة بدقة
         val headerBox = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -150,7 +149,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         })
         root.addView(headerBox)
 
-        // المجموعة 1: حالة التعرّف وخدمة شاشة القفل
         val statusGroup = createInsetGroup()
         val statusRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -205,7 +203,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         statusGroup.addView(accessRow)
         root.addView(statusGroup)
 
-        // المجموعة 2: إدارة الوجه والاختبار الفوري
         val faceActionsGroup = createInsetGroup()
 
         enrollRowText = TextView(themedCtx).apply {
@@ -220,7 +217,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         faceActionsGroup.addView(enrollRowText)
         faceActionsGroup.addView(createHairlineDivider())
 
-        // إعادة ميزة اختبار القفل الأصلية بتصميم متناسق
         testRowText = TextView(themedCtx).apply {
             text = "اختبار التعرّف على الوجه"
             textSize = 16f
@@ -242,7 +238,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         faceActionsGroup.addView(removeRowText)
         root.addView(faceActionsGroup)
 
-        // المجموعة 3: الذكاء والانتباه (مستوحاة من Apple Face ID و Samsung)
         root.addView(createSectionLabel("الانتباه والذكاء التكيفي"))
         val smartGroup = createInsetGroup()
 
@@ -263,8 +258,16 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         smartGroup.addView(createHairlineDivider())
 
         smartGroup.addView(createSmartToggleRow(
-            title = "إضاءة الشاشة في الظلام الدامس",
-            subtitle = "رفع السطوع تلقائياً فقط عندما تكون الغرفة مظلمة",
+            title = "كبسولة التعرّف التفاعلية",
+            subtitle = "مؤشر ديناميكي سلس ينبثق من أعلى الشاشة أثناء المسح",
+            key = SmartFaceEngine.KEY_CAPSULE_ANIM,
+            defaultVal = true
+        ))
+        smartGroup.addView(createHairlineDivider())
+
+        smartGroup.addView(createSmartToggleRow(
+            title = "إطار الإضاءة الناعم في الظلام",
+            subtitle = "إضاءة حواف الشاشة بنعومة تلقائياً في الظلام الدامس فقط",
             key = SmartFaceEngine.KEY_NIGHT_LIGHT,
             defaultVal = false
         ))
@@ -278,7 +281,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         ))
         root.addView(smartGroup)
 
-        // المجموعة 4: سلوك شاشة القفل والأمان (بديل أنيق للإعدادات القديمة)
         root.addView(createSectionLabel("سلوك شاشة القفل والأمان"))
         val lockBehaviorGroup = createInsetGroup()
 
@@ -306,15 +308,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         ))
         lockBehaviorGroup.addView(createHairlineDivider())
 
-        lockBehaviorGroup.addView(createSysToggleRow(
-            title = "إظهار شريط الحالة أعلى القفل",
-            subtitle = "عرض رسالة صغيرة أثناء التحقق من الوجه",
-            initialVal = sysPrefs.showStatusText.get(),
-            onChanged = { sysPrefs.showStatusText.set(it) }
-        ))
-        lockBehaviorGroup.addView(createHairlineDivider())
-
-        // صف اختيار حركة فتح القفل
         val animRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -598,9 +591,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         }
     }
 
-    /**
-     * أيقونة Apple Face ID مرسومة بدقة متجهية
-     */
     private class FaceIdEmblemView(ctx: Context, color: Int) : View(ctx) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color
@@ -618,7 +608,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             val arm = w * 0.22f
             val r = w * 0.16f
 
-            // زوايا إطار Face ID الأربع
             canvas.drawArc(RectF(pad, pad, pad + 2 * r, pad + 2 * r), 180f, 90f, false, paint)
             canvas.drawLine(pad + r, pad, pad + arm, pad, paint)
             canvas.drawLine(pad, pad + r, pad, pad + arm, paint)
@@ -635,7 +624,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
             canvas.drawLine(w - pad - arm, h - pad, w - pad - r, h - pad, paint)
             canvas.drawLine(w - pad, h - pad - arm, w - pad, h - pad - r, paint)
 
-            // العينان والأنف والابتسامة
             val eyeY = h * 0.40f
             canvas.drawLine(w * 0.35f, eyeY - h * 0.04f, w * 0.35f, eyeY + h * 0.04f, paint)
             canvas.drawLine(w * 0.65f, eyeY - h * 0.04f, w * 0.65f, eyeY + h * 0.04f, paint)

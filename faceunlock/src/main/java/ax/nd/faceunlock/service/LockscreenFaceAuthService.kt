@@ -1,13 +1,15 @@
 package ax.nd.faceunlock.service
 
 import android.accessibilityservice.AccessibilityService
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Color
-import android.graphics.PixelFormat
+import android.graphics.*
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -18,19 +20,19 @@ import android.media.ToneGenerator
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.util.TypedValue
 import android.view.Display
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.widget.TextView
+import android.view.animation.LinearInterpolator
+import android.view.animation.PathInterpolator
 import androidx.core.content.getSystemService
 import ax.nd.faceunlock.FaceApplication
 import ax.nd.faceunlock.LibManager
 import ax.nd.faceunlock.backend.SmartFaceEngine
 import ax.nd.faceunlock.pref.Prefs
 import ax.nd.faceunlock.util.Util
-import ax.nd.faceunlock.util.dpToPx
 import ax.nd.universalauth.xposed.common.XposedConstants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,24 +40,43 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbacks, SensorEventListener {
+
     private var windowManager: WindowManager? = null
-    private var textView: TextView? = null
-    private val params = WindowManager.LayoutParams(
+
+    private var islandView: DynamicFaceIslandView? = null
+    private var islandAdded: Boolean = false
+    private val islandParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+                or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
         PixelFormat.TRANSLUCENT
     ).apply {
-        gravity = Gravity.TOP
+        gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        y = 0
         screenBrightness = -1.0f
     }
 
+    private var glowView: SoftEdgeGlowView? = null
+    private var glowAdded: Boolean = false
+    private val glowParams = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+        PixelFormat.TRANSLUCENT
+    ).apply {
+        gravity = Gravity.CENTER
+        screenBrightness = 0.78f
+    }
+
     private var active: Boolean = false
-    private var viewAdded: Boolean = false
     private var lockStateReceiver: BroadcastReceiver? = null
     private var unlockReceiver: BroadcastReceiver? = null
     private var controller: FaceAuthServiceController? = null
@@ -63,18 +84,16 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private var displayManager: DisplayManager? = null
     private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
-    private var lastAmbientLux: Float = 100f
     private var handler: Handler? = null
 
     private lateinit var serviceJob: Job
     private lateinit var serviceScope: CoroutineScope
     private lateinit var prefs: Prefs
-    private var showStatusText = false
     private var booted = false
 
     private val autoTimeoutRunnable = Runnable {
         if (active) {
-            hide()
+            hide(animated = true)
         }
     }
 
@@ -94,38 +113,33 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
         handler = Handler(Looper.getMainLooper())
 
-        textView = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setShadowLayer(8f, 0f, 0f, Color.BLACK)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            setPadding(0, 14.dpToPx.toInt(), 0, 0)
-            textAlignment = TextView.TEXT_ALIGNMENT_CENTER
-        }
-
         booted = !prefs.requirePinOnBoot.get()
         if (booted) {
             reconfigureUnlockHook()
         }
         setupUnlockReceiver()
-
-        serviceScope.launch {
-            prefs.showStatusText.asFlow().collect { show ->
-                showStatusText = show
-            }
-        }
     }
 
     private fun setupUnlockReceiver() {
         val intentFilter = IntentFilter().apply {
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_SCREEN_OFF)
         }
         unlockReceiver = object : BroadcastReceiver() {
             override fun onReceive(p0: Context?, p1: Intent?) {
-                if (!booted) {
-                    booted = true
-                    reconfigureUnlockHook()
+                when (p1?.action) {
+                    Intent.ACTION_USER_PRESENT -> {
+                        if (!booted) {
+                            booted = true
+                            reconfigureUnlockHook()
+                        }
+                        prefs.failedUnlockAttempts.set(0)
+                        forceImmediateCleanup()
+                    }
+                    Intent.ACTION_SCREEN_OFF -> {
+                        forceImmediateCleanup()
+                    }
                 }
-                prefs.failedUnlockAttempts.set(0)
             }
         }
         registerReceiver(unlockReceiver, intentFilter, RECEIVER_EXPORTED)
@@ -175,7 +189,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
                 if (mode) {
                     show()
                 } else {
-                    hide()
+                    hide(animated = true)
                 }
             }
         }
@@ -202,7 +216,7 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         super.onDestroy()
         unregisterLockStateReceiver()
         unregisterUnlockReceiver()
-        hide()
+        forceImmediateCleanup()
         serviceJob.cancel()
     }
 
@@ -211,85 +225,118 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         if (mainDisplayOn && keyguardManager?.isKeyguardLocked == true) {
             show()
         } else {
-            hide()
+            forceImmediateCleanup()
         }
     }
 
     private fun show() {
-        if (!active) {
-            if (Util.isFaceUnlockEnrolled(this)) {
-                active = true
-                lastAmbientLux = 100f
-                lightSensor?.let {
-                    sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
-                }
+        if (active) return
+        if (!Util.isFaceUnlockEnrolled(this)) return
 
-                params.screenBrightness = -1.0f
-                if (showStatusText) {
-                    textView?.text = "جاري التحقق من الوجه..."
-                    addOrUpdateOverlay()
-                }
+        active = true
+        lightSensor?.let {
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
+        }
 
-                handler?.removeCallbacks(autoTimeoutRunnable)
-                handler?.postDelayed(autoTimeoutRunnable, 4500L)
+        val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        if (smartPrefs.getBoolean(SmartFaceEngine.KEY_CAPSULE_ANIM, true)) {
+            showDynamicIsland()
+        }
 
-                controller?.start()
+        handler?.removeCallbacks(autoTimeoutRunnable)
+        handler?.postDelayed(autoTimeoutRunnable, 4500L)
+
+        controller?.start()
+    }
+
+    private fun hide(animated: Boolean) {
+        handler?.removeCallbacks(autoTimeoutRunnable)
+        sensorManager?.unregisterListener(this)
+        removeGlowOverlay()
+
+        if (active) {
+            active = false
+            controller?.stop()
+        }
+
+        if (animated && islandAdded && islandView != null) {
+            islandView?.animateOut {
+                removeIslandOverlay()
             }
+        } else {
+            removeIslandOverlay()
         }
     }
 
-    private fun hide() {
+    private fun forceImmediateCleanup() {
         handler?.removeCallbacks(autoTimeoutRunnable)
         sensorManager?.unregisterListener(this)
         if (active) {
             active = false
-            params.screenBrightness = -1.0f
-            removeTextViewFromWindowManager()
             controller?.stop()
         }
+        removeGlowOverlay()
+        removeIslandOverlay()
     }
 
-    private fun addOrUpdateOverlay() {
+    private fun showDynamicIsland() {
+        removeIslandOverlay()
         try {
-            if (!viewAdded) {
-                windowManager?.addView(textView, params)
-                viewAdded = true
-            } else {
-                windowManager?.updateViewLayout(textView, params)
-            }
+            val view = DynamicFaceIslandView(this)
+            islandView = view
+            windowManager?.addView(view, islandParams)
+            islandAdded = true
+            view.animateIn()
         } catch (_: Exception) {
         }
     }
 
-    private fun removeTextViewFromWindowManager() {
-        if (viewAdded) {
+    private fun removeIslandOverlay() {
+        if (islandAdded) {
             try {
-                windowManager?.removeView(textView)
+                islandView?.stopAnimators()
+                windowManager?.removeView(islandView)
             } catch (_: Exception) {
             }
-            viewAdded = false
+            islandView = null
+            islandAdded = false
+        }
+    }
+
+    private fun showGlowOverlay() {
+        if (glowAdded) return
+        try {
+            val view = SoftEdgeGlowView(this)
+            glowView = view
+            windowManager?.addView(view, glowParams)
+            glowAdded = true
+            view.alpha = 0f
+            view.animate().alpha(1f).setDuration(220).start()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun removeGlowOverlay() {
+        if (glowAdded) {
+            try {
+                windowManager?.removeView(glowView)
+            } catch (_: Exception) {
+            }
+            glowView = null
+            glowAdded = false
         }
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (!active || event?.sensor?.type != Sensor.TYPE_LIGHT) return
-        lastAmbientLux = event.values.firstOrNull() ?: 100f
+        val lux = event.values.firstOrNull() ?: 100f
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
 
-        if (nightLightEnabled && lastAmbientLux < 10f) {
-            if (params.screenBrightness != 0.72f) {
-                params.screenBrightness = 0.72f
-                if (!showStatusText) textView?.text = ""
-                addOrUpdateOverlay()
-            }
-        } else if (params.screenBrightness > 0f) {
-            params.screenBrightness = -1.0f
-            if (!showStatusText) {
-                removeTextViewFromWindowManager()
-            } else {
-                addOrUpdateOverlay()
-            }
+        if (nightLightEnabled && lux < 12f) {
+            showGlowOverlay()
+        } else {
+            removeGlowOverlay()
         }
     }
 
@@ -322,19 +369,245 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             putExtra(XposedConstants.EXTRA_UNLOCK_MODE, unlockAnimation)
             putExtra(XposedConstants.EXTRA_BYPASS_KEYGUARD, prefs.bypassKeyguard.get())
         })
+
         handler?.post {
-            hide()
+            handler?.removeCallbacks(autoTimeoutRunnable)
+            sensorManager?.unregisterListener(this)
+            removeGlowOverlay()
+            active = false
+
+            if (islandAdded && islandView != null) {
+                islandView?.showSuccessAndRetract {
+                    removeIslandOverlay()
+                }
+            } else {
+                removeIslandOverlay()
+            }
         }
     }
 
     override fun onError(errId: Int, message: String) {
         handler?.post {
-            if (showStatusText) {
-                textView?.text = message
-                handler?.postDelayed({ hide() }, 1000)
-            } else {
-                hide()
+            hide(animated = true)
+        }
+    }
+
+    private class DynamicFaceIslandView(ctx: Context) : View(ctx) {
+        private val density = ctx.resources.displayMetrics.density
+        private val pillW = (148f * density).toInt()
+        private val pillH = (38f * density).toInt()
+
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#0A0C10")
+            style = Paint.Style.FILL
+        }
+        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#2A303E")
+            style = Paint.Style.STROKE
+            strokeWidth = 1.1f * density
+        }
+        private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#0A84FF")
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            strokeWidth = 2.0f * density
+        }
+        private val scanBeamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#660A84FF")
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeWidth = 1.6f * density
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#F5F7FA")
+            textSize = 12.5f * density
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            textAlign = Paint.Align.CENTER
+        }
+
+        private val clipPath = Path()
+        private var scanPhase = 0f
+        private var isSuccess = false
+        private var successProgress = 0f
+        private var scanAnimator: ValueAnimator? = null
+
+        init {
+            startScanLoop()
+        }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            setMeasuredDimension(pillW, pillH)
+        }
+
+        private fun startScanLoop() {
+            scanAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 1100L
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                interpolator = LinearInterpolator()
+                addUpdateListener {
+                    scanPhase = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
             }
+        }
+
+        fun animateIn() {
+            pivotX = pillW * 0.5f
+            pivotY = 0f
+            scaleX = 0.42f
+            scaleY = 0f
+            alpha = 0f
+            animate()
+                .scaleX(1f)
+                .scaleY(1f)
+                .alpha(1f)
+                .setDuration(300L)
+                .setInterpolator(PathInterpolator(0.22f, 1.0f, 0.36f, 1.0f))
+                .start()
+        }
+
+        fun showSuccessAndRetract(onDone: () -> Unit) {
+            scanAnimator?.cancel()
+            isSuccess = true
+            iconPaint.color = Color.parseColor("#30D158")
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 180L
+                addUpdateListener {
+                    successProgress = it.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        postDelayed({ animateOut(onDone) }, 140L)
+                    }
+                })
+                start()
+            }
+        }
+
+        fun animateOut(onDone: () -> Unit) {
+            scanAnimator?.cancel()
+            pivotX = pillW * 0.5f
+            pivotY = 0f
+            animate()
+                .scaleX(0.42f)
+                .scaleY(0f)
+                .alpha(0f)
+                .setDuration(210L)
+                .setInterpolator(PathInterpolator(0.4f, 0f, 1f, 1f))
+                .setListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        onDone()
+                    }
+                })
+                .start()
+        }
+
+        fun stopAnimators() {
+            scanAnimator?.cancel()
+            animate().cancel()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val bottomR = h * 0.50f
+
+            clipPath.reset()
+            clipPath.addRoundRect(
+                RectF(0f, 0f, w, h),
+                floatArrayOf(0f, 0f, 0f, 0f, bottomR, bottomR, bottomR, bottomR),
+                Path.Direction.CW
+            )
+            canvas.drawPath(clipPath, bgPaint)
+            canvas.drawPath(clipPath, borderPaint)
+
+            val iconSize = 18f * density
+            val iconLeft = 18f * density
+            val iconTop = (h - iconSize) * 0.5f
+
+            if (isSuccess) {
+                val p = Path().apply {
+                    moveTo(iconLeft + iconSize * 0.18f, iconTop + iconSize * 0.52f)
+                    lineTo(iconLeft + iconSize * 0.42f, iconTop + iconSize * 0.76f)
+                    if (successProgress > 0.4f) {
+                        val t = ((successProgress - 0.4f) / 0.6f).coerceIn(0f, 1f)
+                        lineTo(
+                            iconLeft + iconSize * (0.42f + 0.42f * t),
+                            iconTop + iconSize * (0.76f - 0.50f * t)
+                        )
+                    }
+                }
+                canvas.drawPath(p, iconPaint)
+                val fontMetrics = textPaint.fontMetrics
+                val textY = h * 0.5f - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
+                canvas.drawText("تم الفتح", w * 0.58f, textY, textPaint)
+            } else {
+                drawMiniFaceId(canvas, iconLeft, iconTop, iconSize)
+                val beamY = iconTop + iconSize * (0.15f + 0.70f * scanPhase)
+                canvas.drawLine(iconLeft + 2f * density, beamY, iconLeft + iconSize - 2f * density, beamY, scanBeamPaint)
+
+                val fontMetrics = textPaint.fontMetrics
+                val textY = h * 0.5f - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
+                canvas.drawText("جاري التحقق", w * 0.58f, textY, textPaint)
+            }
+        }
+
+        private fun drawMiniFaceId(canvas: Canvas, l: Float, t: Float, s: Float) {
+            val arm = s * 0.24f
+            val r = s * 0.16f
+            val right = l + s
+            val bottom = t + s
+
+            canvas.drawArc(RectF(l, t, l + 2 * r, t + 2 * r), 180f, 90f, false, iconPaint)
+            canvas.drawLine(l + r, t, l + arm, t, iconPaint)
+            canvas.drawLine(l, t + r, l, t + arm, iconPaint)
+
+            canvas.drawArc(RectF(right - 2 * r, t, right, t + 2 * r), 270f, 90f, false, iconPaint)
+            canvas.drawLine(right - arm, t, right - r, t, iconPaint)
+            canvas.drawLine(right, t + r, right, t + arm, iconPaint)
+
+            canvas.drawArc(RectF(l, bottom - 2 * r, l + 2 * r, bottom), 90f, 90f, false, iconPaint)
+            canvas.drawLine(l + r, bottom, l + arm, bottom, iconPaint)
+            canvas.drawLine(l, bottom - arm, l, bottom - r, iconPaint)
+
+            canvas.drawArc(RectF(right - 2 * r, bottom - 2 * r, right, bottom), 0f, 90f, false, iconPaint)
+            canvas.drawLine(right - arm, bottom, right - r, bottom, iconPaint)
+            canvas.drawLine(right, bottom - arm, right, bottom - r, iconPaint)
+
+            val eyeY = t + s * 0.40f
+            canvas.drawLine(l + s * 0.35f, eyeY - s * 0.05f, l + s * 0.35f, eyeY + s * 0.05f, iconPaint)
+            canvas.drawLine(l + s * 0.65f, eyeY - s * 0.05f, l + s * 0.65f, eyeY + s * 0.05f, iconPaint)
+            canvas.drawArc(RectF(l + s * 0.36f, t + s * 0.48f, l + s * 0.64f, t + s * 0.68f), 25f, 130f, false, iconPaint)
+        }
+    }
+
+    private class SoftEdgeGlowView(ctx: Context) : View(ctx) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val cx = w * 0.5f
+            val cy = h * 0.5f
+            val radius = maxOf(w, h) * 0.72f
+
+            paint.shader = RadialGradient(
+                cx, cy, radius,
+                intArrayOf(
+                    Color.TRANSPARENT,
+                    Color.argb(35, 255, 255, 255),
+                    Color.argb(190, 255, 255, 255)
+                ),
+                floatArrayOf(0.55f, 0.82f, 1.0f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawRect(0f, 0f, w, h, paint)
         }
     }
 

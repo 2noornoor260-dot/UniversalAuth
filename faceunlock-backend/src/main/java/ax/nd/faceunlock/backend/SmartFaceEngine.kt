@@ -27,23 +27,26 @@ class SmartFaceEngine(context: Context) {
 
     companion object {
         private const val TAG = "SmartFaceEngine"
-        private const val MAX_TEMPLATES = 16
-        private const val DB_FILE_NAME = "smart_face_templates_v3.enc"
+        private const val MAX_TEMPLATES = 18
+        private const val DB_FILE_NAME = "smart_face_templates_v4.enc"
         const val PREFS_NAME = "smart_face_prefs"
+        private const val KEY_CACHED_ROTATION = "cached_camera_rotation"
 
         // مفاتيح تجربة الاستخدام الذكية
         const val KEY_REQUIRE_EYES = "req_eyes_open"
         const val KEY_ADAPTIVE = "adaptive_learning"
         const val KEY_NIGHT_LIGHT = "night_fill_light"
         const val KEY_UNLOCK_CHIME = "unlock_chime_sound"
+        const val KEY_CAPSULE_ANIM = "dynamic_capsule_anim"
 
-        // معايرة دقيقة لكاميرا التابلت (سرعة عالية + حماية ثلاثية الأبعاد)
-        private const val OPTIMAL_MATCH_THRESHOLD = 0.50f
-        private const val HIGH_CONFIDENCE_INSTANT_THRESHOLD = 0.66f
-        private const val OPTIMAL_SPOOF_THRESHOLD = 0.38f
-        private const val MIN_NOSE_PROTRUSION_3D = 0.065f
-        private const val MIN_SKIN_SHARPNESS = 4.5f
-        private const val OPTIMAL_MAX_HEAD_ANGLE = 34f
+        // معايرة دقيقة لكاميرا التابلت (سرعة فائقة + حماية 4 طبقات)
+        private const val MATCH_COMBINED_THRESHOLD = 0.45f
+        private const val MATCH_SINGLE_MAX_THRESHOLD = 0.49f
+        private const val INSTANT_UNLOCK_THRESHOLD = 0.56f
+        private const val OPTIMAL_SPOOF_THRESHOLD = 0.40f
+        private const val MIN_NOSE_PROTRUSION_3D = 0.028f
+        private const val MIN_SKIN_SHARPNESS = 1.8f
+        private const val OPTIMAL_MAX_HEAD_ANGLE = 36f
 
         @JvmField var currentEnrollHint: String = "ضع وجهك داخل الإطار وانظر للأمام"
         @JvmField var currentEnrollPercent: Float = 0f
@@ -93,11 +96,16 @@ class SmartFaceEngine(context: Context) {
     private var lastVerifiedTimeMs: Long = 0L
 
     init {
+        val savedRot = prefs.getInt(KEY_CACHED_ROTATION, -1)
+        if (savedRot != -1) {
+            lastWorkingRotation = savedRot
+        }
+
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.16f)
+            .setMinFaceSize(0.15f)
             .build()
         faceDetector = FaceDetection.getClient(options)
 
@@ -154,19 +162,18 @@ class SmartFaceEngine(context: Context) {
             enrolledTemplates.clear()
         }
 
-        val (bitmap, faces) = detectFastNV21(nv21, width, height, rotation)
-        if (bitmap == null || faces.isEmpty()) {
+        val detected = detectFastNV21(nv21, width, height, rotation) ?: run {
             currentEnrollHint = "ضع وجهك داخل الإطار"
             return CODE_NO_FACE
         }
-        if (faces.size > 1) {
+
+        if (detected.allFacesCount > 1) {
             currentEnrollHint = "يوجد أكثر من وجه في الكادر"
             return CODE_MULTI_FACE
         }
 
-        val face = faces[0]
-        val faceRatio = face.boundingBox.width().toFloat() / bitmap.width.toFloat()
-        if (faceRatio < 0.16f) {
+        val faceRatio = detected.scaledBox.width().toFloat() / detected.bitmap.width.toFloat()
+        if (faceRatio < 0.15f) {
             currentEnrollHint = "اقترب قليلاً من الشاشة"
             return CODE_TOO_SMALL
         }
@@ -175,33 +182,33 @@ class SmartFaceEngine(context: Context) {
             return CODE_TOO_LARGE
         }
 
-        val yaw = face.headEulerAngleY
-        val pitch = face.headEulerAngleX
+        val yaw = detected.yaw
+        val pitch = detected.pitch
         currentEnrollStage = enrollStage
 
         val angleMatched = when (enrollStage) {
             0 -> {
                 currentEnrollHint = "انظر للأمام مباشرة بثبات"
-                abs(yaw) <= 14f && abs(pitch) <= 15f
+                abs(yaw) <= 15f && abs(pitch) <= 16f
             }
             1 -> {
                 currentEnrollHint = "أدر رأسك ببطء نحو اليمين"
-                if (abs(yaw) in 11f..40f) {
+                if (abs(yaw) in 10f..42f) {
                     if (stageSamples == 0) stage1YawSign = if (yaw >= 0) 1f else -1f
                     true
                 } else false
             }
             2 -> {
                 currentEnrollHint = "أدر رأسك ببطء نحو اليسار"
-                (yaw * -stage1YawSign) in 11f..40f
+                (yaw * -stage1YawSign) in 10f..42f
             }
             3 -> {
                 currentEnrollHint = "ارفع ذقنك قليلاً للأعلى"
-                pitch in 7f..34f
+                pitch in 6f..35f
             }
             4 -> {
                 currentEnrollHint = "اخفض ذقنك قليلاً للأسفل"
-                pitch in -34f..-7f
+                pitch in -35f..-6f
             }
             else -> true
         }
@@ -210,22 +217,23 @@ class SmartFaceEngine(context: Context) {
             return CODE_KEEP_STILL
         }
 
-        val aligned = alignAndCrop(bitmap, face, recInputSize)
+        val aligned = alignAndCrop(detected.bitmap, detected.scaledBox, detected.leftEye, detected.rightEye, recInputSize)
         val embedding = extractEmbedding(aligned) ?: return CODE_KEEP_STILL
 
         enrolledTemplates.add(embedding)
         stageSamples++
 
-        val completedSteps = (enrollStage * 2 + stageSamples).toFloat()
-        currentEnrollPercent = ((completedSteps / 10f) * 100f).coerceIn(5f, 100f)
+        val completedSteps = (enrollStage * 3 + stageSamples).toFloat()
+        currentEnrollPercent = ((completedSteps / 15f) * 100f).coerceIn(4f, 100f)
 
-        if (stageSamples >= 2) {
+        if (stageSamples >= 3) {
             enrollStage++
             stageSamples = 0
             currentEnrollStage = enrollStage
         }
 
         return if (enrollStage >= 5) {
+            computeCentroidEmbedding()?.let { enrolledTemplates.add(0, it) }
             currentEnrollPercent = 100f
             currentEnrollHint = "اكتمل إعداد التعرّف على الوجه"
             saveTemplates()
@@ -250,41 +258,33 @@ class SmartFaceEngine(context: Context) {
         val requireEyesOpen = prefs.getBoolean(KEY_REQUIRE_EYES, true)
         val adaptiveLearning = prefs.getBoolean(KEY_ADAPTIVE, true)
 
-        val (bitmap, faces) = detectFastNV21(nv21, width, height, rotation)
-        if (bitmap == null || faces.isEmpty()) return CODE_NO_FACE
+        val detected = detectFastNV21(nv21, width, height, rotation) ?: return CODE_NO_FACE
 
-        val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-            ?: return CODE_NO_FACE
-
-        if (abs(face.headEulerAngleY) > OPTIMAL_MAX_HEAD_ANGLE || abs(face.headEulerAngleZ) > OPTIMAL_MAX_HEAD_ANGLE) {
-            return if (face.headEulerAngleY > 0) CODE_ROTATED_LEFT else CODE_ROTATED_RIGHT
+        if (abs(detected.yaw) > OPTIMAL_MAX_HEAD_ANGLE || abs(detected.roll) > OPTIMAL_MAX_HEAD_ANGLE) {
+            return if (detected.yaw > 0) CODE_ROTATED_LEFT else CODE_ROTATED_RIGHT
         }
 
         if (requireEyesOpen) {
-            val left = face.leftEyeOpenProbability ?: 1f
-            val right = face.rightEyeOpenProbability ?: 1f
-            if (left < 0.48f || right < 0.48f) {
+            if (detected.leftEyeOpen < 0.45f || detected.rightEyeOpen < 0.45f) {
                 return CODE_EYES_CLOSED
             }
         }
 
-        val alignedFace = alignAndCrop(bitmap, face, recInputSize)
+        val alignedFace = alignAndCrop(detected.bitmap, detected.scaledBox, detected.leftEye, detected.rightEye, recInputSize)
 
-        // الطبقة 1: فحص حدة نسيج الجلد لمنع الشاشات والصور الباهتة
         if (computeTextureSharpness(alignedFace) < MIN_SKIN_SHARPNESS) {
             return CODE_SPOOF_WARNING
         }
 
-        // تشغيل النماذج الثلاثة بالتوازي لأقصى سرعة
         val meshFuture = aiExecutor.submit(Callable {
             runCatching {
-                Tasks.await(meshDetector.process(InputImage.fromBitmap(bitmap, 0)), 320, TimeUnit.MILLISECONDS)
+                Tasks.await(meshDetector.process(InputImage.fromBitmap(detected.bitmap, 0)), 260, TimeUnit.MILLISECONDS)
             }.getOrNull()
         })
 
         val spoofFuture = aiExecutor.submit(Callable {
             if (antiSpoofInterpreter == null) return@Callable 1.0f
-            val wideContext = cropExpanded(bitmap, face.boundingBox, scale = 2.2f, targetSize = spoofInputSize)
+            val wideContext = cropExpanded(detected.bitmap, detected.scaledBox, scale = 2.1f, targetSize = spoofInputSize)
             runAntiSpoofing(wideContext)
         })
 
@@ -292,18 +292,16 @@ class SmartFaceEngine(context: Context) {
             extractEmbedding(alignedFace)
         })
 
-        val meshes = runCatching { meshFuture.get(350, TimeUnit.MILLISECONDS) }.getOrNull()
-        val realScore = runCatching { spoofFuture.get(350, TimeUnit.MILLISECONDS) }.getOrDefault(1.0f)
-        val currentEmbedding = runCatching { embedFuture.get(350, TimeUnit.MILLISECONDS) }.getOrNull()
+        val meshes = runCatching { meshFuture.get(280, TimeUnit.MILLISECONDS) }.getOrNull()
+        val realScore = runCatching { spoofFuture.get(280, TimeUnit.MILLISECONDS) }.getOrDefault(1.0f)
+        val currentEmbedding = runCatching { embedFuture.get(280, TimeUnit.MILLISECONDS) }.getOrNull()
             ?: return CODE_MISMATCH
 
-        // الطبقة 2: كشف التزييف العصبي (MiniFASNet)
         if (realScore < OPTIMAL_SPOOF_THRESHOLD) {
             lastVerifiedEmbedding = null
             return CODE_SPOOF_WARNING
         }
 
-        // الطبقة 3: التحقق من بروز الأنف ثلاثي الأبعاد مقارنة بالخدين (468 نقطة)
         if (!meshes.isNullOrEmpty()) {
             val pts = meshes[0].allPoints
             if (pts.size >= 468) {
@@ -311,7 +309,7 @@ class SmartFaceEngine(context: Context) {
                 val leftCheekZ = pts[234].position.z
                 val rightCheekZ = pts[454].position.z
                 val cheekAvgZ = (leftCheekZ + rightCheekZ) * 0.5f
-                val noseProtrusion = (cheekAvgZ - noseZ) / max(1f, face.boundingBox.width().toFloat())
+                val noseProtrusion = (cheekAvgZ - noseZ) / max(1f, detected.scaledBox.width().toFloat())
                 if (noseProtrusion < MIN_NOSE_PROTRUSION_3D) {
                     lastVerifiedEmbedding = null
                     return CODE_SPOOF_WARNING
@@ -319,24 +317,25 @@ class SmartFaceEngine(context: Context) {
             }
         }
 
-        // مطابقة البصمة
-        val bestScore = enrolledTemplates.maxOfOrNull { cosineSimilarity(currentEmbedding, it) } ?: 0f
-        if (bestScore < OPTIMAL_MATCH_THRESHOLD) {
-            lastVerifiedEmbedding = null
+        val scores = enrolledTemplates.map { cosineSimilarity(currentEmbedding, it) }
+        val maxScore = scores.maxOrNull() ?: 0f
+        val top3Avg = scores.sortedDescending().take(3).average().toFloat()
+        val combinedScore = maxScore * 0.65f + top3Avg * 0.35f
+
+        if (combinedScore < MATCH_COMBINED_THRESHOLD && maxScore < MATCH_SINGLE_MAX_THRESHOLD) {
             return CODE_MISMATCH
         }
 
-        // الطبقة 4: الفتح الفوري عند الثقة العالية جداً، أو التحقق عبر إطارين متتاليين عند الثقة المتوسطة
         val now = System.currentTimeMillis()
-        if (bestScore < HIGH_CONFIDENCE_INSTANT_THRESHOLD) {
+        if (maxScore < INSTANT_UNLOCK_THRESHOLD) {
             val prevEmb = lastVerifiedEmbedding
-            if (prevEmb == null || (now - lastVerifiedTimeMs) > 1200L) {
+            if (prevEmb == null || (now - lastVerifiedTimeMs) > 1500L) {
                 lastVerifiedEmbedding = currentEmbedding
                 lastVerifiedTimeMs = now
                 return CODE_KEEP_STILL
             }
             val frameToFrameSim = cosineSimilarity(currentEmbedding, prevEmb)
-            if (frameToFrameSim > 0.9997f) {
+            if (frameToFrameSim > 0.9998f) {
                 lastVerifiedEmbedding = null
                 return CODE_SPOOF_WARNING
             }
@@ -344,10 +343,9 @@ class SmartFaceEngine(context: Context) {
 
         lastVerifiedEmbedding = null
 
-        // التعلّم التكيفي الذكي
-        if (adaptiveLearning && bestScore in 0.60f..0.88f) {
+        if (adaptiveLearning && maxScore in 0.58f..0.86f) {
             if (enrolledTemplates.size >= MAX_TEMPLATES) {
-                enrolledTemplates.removeAt(4)
+                enrolledTemplates.removeAt(5)
             }
             enrolledTemplates.add(currentEmbedding)
             saveTemplates()
@@ -356,26 +354,80 @@ class SmartFaceEngine(context: Context) {
         return CODE_SUCCESS
     }
 
-    /**
-     * دعم تلقائي للوضع الطولي والأفقي على التابلت دون تعليق على زاوية واحدة
-     */
-    private fun detectFastNV21(nv21: ByteArray, width: Int, height: Int, requestedRotation: Int): Pair<Bitmap?, List<Face>> {
+    private data class DetectedFrame(
+        val bitmap: Bitmap,
+        val scaledBox: Rect,
+        val leftEye: PointF?,
+        val rightEye: PointF?,
+        val yaw: Float,
+        val pitch: Float,
+        val roll: Float,
+        val leftEyeOpen: Float,
+        val rightEyeOpen: Float,
+        val allFacesCount: Int
+    )
+
+    private fun detectFastNV21(nv21: ByteArray, width: Int, height: Int, requestedRotation: Int): DetectedFrame? {
         val candidates = listOfNotNull(lastWorkingRotation, requestedRotation, 270, 90, 0, 180).distinct()
 
         for (rot in candidates) {
             val inputImage = InputImage.fromByteArray(nv21, width, height, rot, InputImage.IMAGE_FORMAT_NV21)
             val faces = runCatching {
-                Tasks.await(faceDetector.process(inputImage), 300, TimeUnit.MILLISECONDS)
+                Tasks.await(faceDetector.process(inputImage), 250, TimeUnit.MILLISECONDS)
             }.getOrNull()
 
             if (!faces.isNullOrEmpty()) {
-                lastWorkingRotation = rot
-                val raw = fastNv21ToBitmap(nv21, width, height) ?: return Pair(null, emptyList())
+                if (lastWorkingRotation != rot) {
+                    lastWorkingRotation = rot
+                    prefs.edit().putInt(KEY_CACHED_ROTATION, rot).apply()
+                }
+                val primaryFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: continue
+                val step = if (width >= 480) 2 else 1
+                val raw = fastNv21ToDownsampledBitmap(nv21, width, height, step) ?: return null
                 val rotated = rotateBitmap(raw, rot)
-                return Pair(rotated, faces)
+                val invScale = 1f / step.toFloat()
+
+                val b = primaryFace.boundingBox
+                val scaledBox = Rect(
+                    (b.left * invScale).toInt(),
+                    (b.top * invScale).toInt(),
+                    (b.right * invScale).toInt(),
+                    (b.bottom * invScale).toInt()
+                )
+                val lEye = primaryFace.getLandmark(FaceLandmark.LEFT_EYE)?.position?.let {
+                    PointF(it.x * invScale, it.y * invScale)
+                }
+                val rEye = primaryFace.getLandmark(FaceLandmark.RIGHT_EYE)?.position?.let {
+                    PointF(it.x * invScale, it.y * invScale)
+                }
+
+                return DetectedFrame(
+                    bitmap = rotated,
+                    scaledBox = scaledBox,
+                    leftEye = lEye,
+                    rightEye = rEye,
+                    yaw = primaryFace.headEulerAngleY,
+                    pitch = primaryFace.headEulerAngleX,
+                    roll = primaryFace.headEulerAngleZ,
+                    leftEyeOpen = primaryFace.leftEyeOpenProbability ?: 1f,
+                    rightEyeOpen = primaryFace.rightEyeOpenProbability ?: 1f,
+                    allFacesCount = faces.size
+                )
             }
         }
-        return Pair(null, emptyList())
+        return null
+    }
+
+    private fun computeCentroidEmbedding(): FloatArray? {
+        if (enrolledTemplates.isEmpty()) return null
+        val dim = enrolledTemplates[0].size
+        val sum = FloatArray(dim)
+        for (vec in enrolledTemplates) {
+            if (vec.size == dim) {
+                for (i in 0 until dim) sum[i] += vec[i]
+            }
+        }
+        return l2Normalize(sum)
     }
 
     private fun computeTextureSharpness(bitmap: Bitmap): Float {
@@ -431,21 +483,18 @@ class SmartFaceEngine(context: Context) {
         return l2Normalize(output[0])
     }
 
-    private fun alignAndCrop(source: Bitmap, face: Face, targetSize: Int): Bitmap {
-        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
-        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+    private fun alignAndCrop(source: Bitmap, box: Rect, leftEye: PointF?, rightEye: PointF?, targetSize: Int): Bitmap {
         var rotated = source
-
         if (leftEye != null && rightEye != null) {
             val angle = Math.toDegrees(
                 atan2((rightEye.y - leftEye.y).toDouble(), (rightEye.x - leftEye.x).toDouble())
             ).toFloat()
             val matrix = Matrix().apply {
-                postRotate(-angle, face.boundingBox.exactCenterX(), face.boundingBox.exactCenterY())
+                postRotate(-angle, box.exactCenterX(), box.exactCenterY())
             }
             rotated = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
         }
-        return cropExpanded(rotated, face.boundingBox, scale = 1.15f, targetSize = targetSize)
+        return cropExpanded(rotated, box, scale = 1.15f, targetSize = targetSize)
     }
 
     private fun cropExpanded(bitmap: Bitmap, box: Rect, scale: Float, targetSize: Int): Bitmap {
@@ -460,34 +509,35 @@ class SmartFaceEngine(context: Context) {
         return Bitmap.createScaledBitmap(cropped, targetSize, targetSize, true)
     }
 
-    private fun fastNv21ToBitmap(nv21: ByteArray, width: Int, height: Int): Bitmap? {
+    private fun fastNv21ToDownsampledBitmap(nv21: ByteArray, width: Int, height: Int, step: Int): Bitmap? {
         return try {
             val frameSize = width * height
             if (nv21.size < frameSize) return null
-            val argb = IntArray(frameSize)
-            var yp = 0
-            for (j in 0 until height) {
-                var uvp = frameSize + (j shr 1) * width
-                var u = 0
-                var v = 0
-                for (i in 0 until width) {
-                    var y = (0xff and nv21[yp].toInt()) - 16
+            val outW = width / step
+            val outH = height / step
+            val argb = IntArray(outW * outH)
+            var outIdx = 0
+
+            for (j in 0 until height step step) {
+                if (outIdx >= argb.size) break
+                val uvRow = frameSize + (j shr 1) * width
+                for (i in 0 until width step step) {
+                    if (outIdx >= argb.size) break
+                    val yIdx = j * width + i
+                    val uvIdx = uvRow + (i and 1.inv())
+                    var y = (0xff and nv21[yIdx].toInt()) - 16
                     if (y < 0) y = 0
-                    if ((i and 1) == 0 && uvp + 1 < nv21.size) {
-                        v = (0xff and nv21[uvp++].toInt()) - 128
-                        u = (0xff and nv21[uvp++].toInt()) - 128
-                    }
+                    val v = if (uvIdx < nv21.size) (0xff and nv21[uvIdx].toInt()) - 128 else 0
+                    val u = if (uvIdx + 1 < nv21.size) (0xff and nv21[uvIdx + 1].toInt()) - 128 else 0
+
                     val y1192 = 1192 * y
-                    var r = y1192 + 1634 * v
-                    var g = y1192 - 833 * v - 400 * u
-                    var b = y1192 + 2066 * u
-                    r = r.coerceIn(0, 262143)
-                    g = g.coerceIn(0, 262143)
-                    b = b.coerceIn(0, 262143)
-                    argb[yp++] = -0x1000000 or ((r shl 6) and 0xff0000) or ((g shr 2) and 0xff00) or ((b shr 10) and 0xff)
+                    val r = (y1192 + 1634 * v).coerceIn(0, 262143)
+                    val g = (y1192 - 833 * v - 400 * u).coerceIn(0, 262143)
+                    val b = (y1192 + 2066 * u).coerceIn(0, 262143)
+                    argb[outIdx++] = -0x1000000 or ((r shl 6) and 0xff0000) or ((g shr 2) and 0xff00) or ((b shr 10) and 0xff)
                 }
             }
-            Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
+            Bitmap.createBitmap(argb, outW, outH, Bitmap.Config.ARGB_8888)
         } catch (e: Exception) {
             null
         }
