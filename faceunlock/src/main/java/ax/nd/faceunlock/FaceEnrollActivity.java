@@ -30,7 +30,6 @@ import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
-import android.view.animation.DecelerateInterpolator;
 import android.view.animation.LinearInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -139,7 +138,7 @@ public class FaceEnrollActivity extends FaceBaseActivity {
                         if (!isDestroyed() && !isFinishing()) {
                             startFinishActivity();
                         }
-                    }, 700);
+                    }, 650);
                 }
             });
         }
@@ -293,15 +292,13 @@ public class FaceEnrollActivity extends FaceBaseActivity {
     }
 
     /**
-     * واجهة مطابقة لتصميم آبل الحديث:
-     * بطاقة داكنة مستديرة الزوايا تحيط بمعاينة الوجه الدائرية مع 4 أقواس سميكة فقط (يمين، يسار، فوق، تحت)
+     * معاينة كاميرا دائرية كبيرة وواضحة بحجم كامل محاطة بـ 4 أقواس سميكة فقط (يمين، يسار، فوق، تحت)
      */
     private void init() {
         int pageBg = mIsDarkTheme ? Color.parseColor("#000000") : Color.parseColor("#F5F5F7");
         int primaryText = mIsDarkTheme ? Color.parseColor("#FFFFFF") : Color.parseColor("#1D1D1F");
         int pillBg = mIsDarkTheme ? Color.parseColor("#1C1C1E") : Color.parseColor("#E5E5EA");
         int appleBlue = mIsDarkTheme ? Color.parseColor("#0A84FF") : Color.parseColor("#007AFF");
-        int cardDarkBg = Color.parseColor("#111215");
 
         mRootFrame = new FrameLayout(this);
         mRootFrame.setBackgroundColor(pageBg);
@@ -312,31 +309,17 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         root.setPadding(dp(24), dp(24), dp(24), dp(32));
         root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
 
-        // مساحة مرنة علوية
         View topSpacer = new View(this);
-        topSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 0.7f));
+        topSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 0.75f));
         root.addView(topSpacer);
 
-        // البطاقة الداكنة مستديرة الزوايا (Squircle Viewport) كما في التصميم المرجعي
-        int cardSize = dp(296);
-        int camCircleSize = dp(206);
-        int arcRingSize = dp(254);
+        // حاوية الكاميرا الدائرية الكبيرة (276dp) + الأقواس الأربعة السميكة (306dp)
+        int outerRingSize = dp(306);
+        int camCircleSize = dp(274);
 
-        FrameLayout darkViewportCard = new FrameLayout(this);
-        GradientDrawable cardDrawable = new GradientDrawable();
-        cardDrawable.setColor(cardDarkBg);
-        cardDrawable.setCornerRadius(dp(34));
-        darkViewportCard.setBackground(cardDrawable);
-        darkViewportCard.setClipToOutline(true);
-        darkViewportCard.setOutlineProvider(new ViewOutlineProvider() {
-            @Override
-            public void getOutline(View view, Outline outline) {
-                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(34));
-            }
-        });
-        darkViewportCard.setLayoutParams(new LinearLayout.LayoutParams(cardSize, cardSize));
+        FrameLayout cameraRingContainer = new FrameLayout(this);
+        cameraRingContainer.setLayoutParams(new LinearLayout.LayoutParams(outerRingSize, outerRingSize));
 
-        // معاينة الكاميرا الدائرية في منتصف البطاقة الداكنة
         mSurface = new CircleSurfaceView(this);
         mSurface.setPercent(0f);
         mSurface.setClipToOutline(true);
@@ -346,29 +329,27 @@ public class FaceEnrollActivity extends FaceBaseActivity {
                 outline.setOval(0, 0, view.getWidth(), view.getHeight());
             }
         });
-        darkViewportCard.addView(mSurface, new FrameLayout.LayoutParams(camCircleSize, camCircleSize, Gravity.CENTER));
+        cameraRingContainer.addView(mSurface, new FrameLayout.LayoutParams(camCircleSize, camCircleSize, Gravity.CENTER));
 
-        // قناع صلب بلون البطاقة الداكنة لإخفاء أي زوايا مربعة للـ SurfaceView تماماً
-        CircularCardMaskView maskView = new CircularCardMaskView(this, cardDarkBg, camCircleSize);
-        darkViewportCard.addView(maskView, new FrameLayout.LayoutParams(cardSize, cardSize, Gravity.CENTER));
+        // قناع خارجي بلون الخلفية لضمان حواف دائرية مثالية دون تصغير الكاميرا
+        CircularOuterMaskView maskView = new CircularOuterMaskView(this, pageBg, camCircleSize);
+        cameraRingContainer.addView(maskView, new FrameLayout.LayoutParams(outerRingSize, outerRingSize, Gravity.CENTER));
 
-        // الأقواس الأربعة السميكة (يمين، يسار، فوق، تحت) كما في الصورة المرجعية
-        mFourArcsView = new FourSegmentAppleArcView(this);
-        darkViewportCard.addView(mFourArcsView, new FrameLayout.LayoutParams(arcRingSize, arcRingSize, Gravity.CENTER));
+        // الأقواس الأربعة السميكة (يمين، يسار، فوق، تحت)
+        mFourArcsView = new FourSegmentAppleArcView(this, mIsDarkTheme);
+        cameraRingContainer.addView(mFourArcsView, new FrameLayout.LayoutParams(outerRingSize, outerRingSize, Gravity.CENTER));
 
-        root.addView(darkViewportCard);
+        root.addView(cameraRingContainer);
 
-        // نص التوجيه الواضح أسفل البطاقة مباشرة
         mFaceEnrollMsg = new TextView(this);
         mFaceEnrollMsg.setText(SmartFaceEngine.currentEnrollHint);
-        mFaceEnrollMsg.setTextSize(17.5f);
+        mFaceEnrollMsg.setTextSize(18f);
         mFaceEnrollMsg.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         mFaceEnrollMsg.setTextColor(primaryText);
         mFaceEnrollMsg.setGravity(Gravity.CENTER);
-        mFaceEnrollMsg.setPadding(dp(16), dp(26), dp(16), dp(8));
+        mFaceEnrollMsg.setPadding(dp(16), dp(26), dp(16), dp(6));
         root.addView(mFaceEnrollMsg);
 
-        // مؤشر الزاوية الحالية (1 من 4)
         mStepBadgeText = new TextView(this);
         mStepBadgeText.setText("الزاوية 1 من 4");
         mStepBadgeText.setTextSize(13.5f);
@@ -376,12 +357,10 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         mStepBadgeText.setGravity(Gravity.CENTER);
         root.addView(mStepBadgeText);
 
-        // مساحة مرنة سفلية
         View bottomSpacer = new View(this);
         bottomSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1.0f));
         root.addView(bottomSpacer);
 
-        // زر سفلي دائري الحواف (Pill Button) كما في التصميم المرجعي
         TextView cancelPillBtn = new TextView(this);
         cancelPillBtn.setText("إلغاء الإعداد");
         cancelPillBtn.setTextSize(15.5f);
@@ -401,7 +380,6 @@ public class FaceEnrollActivity extends FaceBaseActivity {
 
         mRootFrame.addView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // مؤشر أسهم صغير بجانب الكاميرا الفعلية في التابلت
         mCameraArrowGuide = new CameraEdgeArrowGuideView(this, mIsDarkTheme);
         mRootFrame.addView(mCameraArrowGuide);
         positionCameraArrowGuide();
@@ -414,10 +392,10 @@ public class FaceEnrollActivity extends FaceBaseActivity {
             public void run() {
                 if (!isFinishing() && !isDestroyed()) {
                     syncProgressUi();
-                    mSurface.postDelayed(this, 110);
+                    mSurface.postDelayed(this, 100);
                 }
             }
-        }, 110);
+        }, 100);
 
         if (mCameraEnrollService == null) {
             mCameraEnrollService = CameraFaceEnrollController.getInstance();
@@ -455,18 +433,15 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         return (int) (val * getResources().getDisplayMetrics().density);
     }
 
-    /**
-     * قناع دائري بلون البطاقة الداكنة (#111215) يقص أي حواف مربعة للكاميرا بنظافة تامة
-     */
-    private static class CircularCardMaskView extends View {
+    private static class CircularOuterMaskView extends View {
         private final Paint maskPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path clipPath = new Path();
         private final float circleDiameter;
 
-        CircularCardMaskView(Context ctx, int cardColor, float circleDiameter) {
+        CircularOuterMaskView(Context ctx, int bgColor, float circleDiameter) {
             super(ctx);
             this.circleDiameter = circleDiameter;
-            maskPaint.setColor(cardColor);
+            maskPaint.setColor(bgColor);
             maskPaint.setStyle(Paint.Style.FILL);
             clipPath.setFillType(Path.FillType.EVEN_ODD);
         }
@@ -483,12 +458,6 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         }
     }
 
-    /**
-     * 4 أقواس سميكة فقط (يمين، يسار، فوق، تحت) كما في واجهة آبل المرجعية:
-     * - الأقواس غير المكتملة: رمادي داكن (#3A3A3C)
-     * - القوس النشط: أزرق آبل نابض (#0A84FF)
-     * - الأقواس المكتملة: أزرق/أخضر مضيء
-     */
     private static class FourSegmentAppleArcView extends View {
         private final Paint inactiveArcPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint activeArcPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -497,22 +466,22 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         private float pulse = 0f;
         private ValueAnimator pulseAnim;
 
-        FourSegmentAppleArcView(Context ctx) {
+        FourSegmentAppleArcView(Context ctx, boolean dark) {
             super(ctx);
             float d = ctx.getResources().getDisplayMetrics().density;
-            float strokeW = 7.5f * d;
+            float strokeW = 7.0f * d;
 
-            inactiveArcPaint.setColor(Color.parseColor("#3A3A3C"));
+            inactiveArcPaint.setColor(dark ? Color.parseColor("#2C2C2E") : Color.parseColor("#D1D1D6"));
             inactiveArcPaint.setStyle(Paint.Style.STROKE);
             inactiveArcPaint.setStrokeCap(Paint.Cap.ROUND);
             inactiveArcPaint.setStrokeWidth(strokeW);
 
-            activeArcPaint.setColor(Color.parseColor("#0A84FF"));
+            activeArcPaint.setColor(dark ? Color.parseColor("#0A84FF") : Color.parseColor("#007AFF"));
             activeArcPaint.setStyle(Paint.Style.STROKE);
             activeArcPaint.setStrokeCap(Paint.Cap.ROUND);
-            activeArcPaint.setStrokeWidth(strokeW + 1.2f * d);
+            activeArcPaint.setStrokeWidth(strokeW + 1.0f * d);
 
-            doneArcPaint.setColor(Color.parseColor("#30D158"));
+            doneArcPaint.setColor(dark ? Color.parseColor("#30D158") : Color.parseColor("#34C759"));
             doneArcPaint.setStyle(Paint.Style.STROKE);
             doneArcPaint.setStrokeCap(Paint.Cap.ROUND);
             doneArcPaint.setStrokeWidth(strokeW);
@@ -540,14 +509,9 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             float d = getResources().getDisplayMetrics().density;
-            float pad = 8f * d;
+            float pad = 6f * d;
             RectF oval = new RectF(pad, pad, getWidth() - pad, getHeight() - pad);
 
-            // ترتيب المراحل الـ 4:
-            // stage 0 = يمين (-36° إلى +36°)
-            // stage 1 = يسار (144° إلى 216°)
-            // stage 2 = فوق (234° إلى 306°)
-            // stage 3 = تحت (54° إلى 126°)
             float[] startAngles = new float[]{-36f, 144f, 234f, 54f};
             float sweep = 72f;
 
@@ -574,9 +538,6 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         }
     }
 
-    /**
-     * مؤشر أسهم صغير يظهر مباشرة بجانب مكان الكاميرا الأمامية في التابلت
-     */
     private static class CameraEdgeArrowGuideView extends View {
         private final Paint pillBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint pillStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -671,19 +632,19 @@ public class FaceEnrollActivity extends FaceBaseActivity {
 
             arrowPaint.setColor(blueColor);
             switch (stage) {
-                case 0: // يمين
+                case 0:
                     drawChevron(canvas, cx - 3f * d + shift, cy, 6f * d, 0f);
                     drawChevron(canvas, cx + 6f * d + shift, cy, 6f * d, 0f);
                     break;
-                case 1: // يسار
+                case 1:
                     drawChevron(canvas, cx + 3f * d - shift, cy, 6f * d, 180f);
                     drawChevron(canvas, cx - 6f * d - shift, cy, 6f * d, 180f);
                     break;
-                case 2: // فوق
+                case 2:
                     drawChevron(canvas, cx, cy + 3f * d - shift, 6f * d, -90f);
                     drawChevron(canvas, cx, cy - 6f * d - shift, 6f * d, -90f);
                     break;
-                case 3: // تحت
+                case 3:
                     drawChevron(canvas, cx, cy - 3f * d + shift, 6f * d, 90f);
                     drawChevron(canvas, cx, cy + 6f * d + shift, 6f * d, 90f);
                     break;

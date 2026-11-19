@@ -52,7 +52,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
     private lateinit var testRowText: TextView
     private lateinit var removeRowText: TextView
     private lateinit var chimeValueText: TextView
-    private lateinit var maxAttemptsValueText: TextView
     private lateinit var animValueText: TextView
 
     private var isDarkTheme = false
@@ -260,8 +259,8 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         smartGroup.addView(createHairlineDivider())
 
         smartGroup.addView(createSmartToggleRow(
-            title = "كبسولة Face ID الفيزيائية النابضة",
-            subtitle = "نتوء حي يتحول فيزيائياً إلى قفل يُفتح أو يهتز عند الرفض",
+            title = "كبسولة Face ID ثلاثية الأبعاد",
+            subtitle = "كرة مسح بيضاء تتحول فيزيائياً إلى قفل عند الفتح أو الرفض",
             key = SmartFaceEngine.KEY_CAPSULE_ANIM,
             defaultVal = true
         ))
@@ -269,13 +268,12 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
 
         smartGroup.addView(createSmartToggleRow(
             title = "لوحة الإضاءة البيضاء في الظلام",
-            subtitle = "تعمل في الظلام الدامس فقط بناءً على مستشعر الضوء وسطوع الكاميرا معاً",
+            subtitle = "تعمل بثبات في الظلام لإضاءة الوجه تلقائياً",
             key = SmartFaceEngine.KEY_NIGHT_LIGHT,
             defaultVal = true
         ))
         smartGroup.addView(createHairlineDivider())
 
-        // اختيار نغمات الفتح المثقولة (Apple Acoustic Chimes)
         val chimeRow = LinearLayout(themedCtx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -303,36 +301,8 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         smartGroup.addView(chimeRow)
         root.addView(smartGroup)
 
-        root.addView(createSectionLabel("سلوك شاشة القفل والأمان"))
+        root.addView(createSectionLabel("سلوك شاشة القفل"))
         val lockBehaviorGroup = createInsetGroup()
-
-        // اختيار الحد الأقصى لمحاولات المسح الفاشلة قبل إيقاف التعرف على الوجه
-        val attemptsRow = LinearLayout(themedCtx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(14))
-            setOnClickListener { showMaxAttemptsPicker() }
-        }
-        attemptsRow.addView(TextView(themedCtx).apply {
-            text = "محاولات المسح قبل الإيقاف"
-            textSize = 15.5f
-            setTextColor(textPrimary)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        maxAttemptsValueText = TextView(themedCtx).apply {
-            text = getMaxAttemptsLabel(smartPrefs.getInt(SmartFaceEngine.KEY_MAX_ATTEMPTS, 5))
-            textSize = 14.5f
-            setTextColor(textSecondary)
-            setPadding(0, 0, dp(6), 0)
-        }
-        attemptsRow.addView(maxAttemptsValueText)
-        attemptsRow.addView(TextView(themedCtx).apply {
-            text = "‹"
-            textSize = 20f
-            setTextColor(textSecondary)
-        })
-        lockBehaviorGroup.addView(attemptsRow)
-        lockBehaviorGroup.addView(createHairlineDivider())
 
         lockBehaviorGroup.addView(createSysToggleRow(
             title = "تخطي شاشة القفل مباشرة",
@@ -426,42 +396,6 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
                 }
             }
             .setPositiveButton("تم", null)
-            .show()
-    }
-
-    private fun getMaxAttemptsLabel(count: Int): String {
-        return when (count) {
-            3 -> "3 محاولات"
-            5 -> "5 محاولات"
-            8 -> "8 محاولات"
-            10 -> "10 محاولات"
-            0 -> "بدون حد"
-            else -> "$count محاولات"
-        }
-    }
-
-    private fun showMaxAttemptsPicker() {
-        val labels = arrayOf(
-            "3 محاولات (أمان فائق)",
-            "5 محاولات (افتراضي)",
-            "8 محاولات",
-            "10 محاولات",
-            "بدون حد (مفتوح دائماً)"
-        )
-        val values = intArrayOf(3, 5, 8, 10, 0)
-        val current = smartPrefs.getInt(SmartFaceEngine.KEY_MAX_ATTEMPTS, 5)
-        val currentIdx = values.indexOf(current).let { if (it < 0) 1 else it }
-
-        AlertDialog.Builder(themedCtx)
-            .setTitle("محاولات المسح قبل الإيقاف")
-            .setSingleChoiceItems(labels, currentIdx) { dialog, which ->
-                val chosen = values[which]
-                smartPrefs.edit().putInt(SmartFaceEngine.KEY_MAX_ATTEMPTS, chosen).apply()
-                SmartFaceEngine.resetFailedAttempts(this)
-                maxAttemptsValueText.text = getMaxAttemptsLabel(chosen)
-                dialog.dismiss()
-            }
-            .setNegativeButton("إلغاء", null)
             .show()
     }
 
