@@ -10,10 +10,10 @@ import android.content.ServiceConnection;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.Paint;
-import android.graphics.RadialGradient;
+import android.graphics.Path;
 import android.graphics.RectF;
-import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.Camera;
@@ -26,9 +26,12 @@ import android.os.Looper;
 import android.os.RemoteException;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -61,6 +64,8 @@ public class FaceEnrollActivity extends FaceBaseActivity {
     private TextView mFaceEnrollMsg;
     private TextView mStepCounterText;
     private AppleFaceIdRingView mTicksView;
+    private CameraEdgeArrowGuideView mCameraArrowGuide;
+    private FrameLayout mRootFrame;
     private final View[] mStagePills = new View[5];
     private boolean mHasCameraPermission = false;
     private CameraFaceEnrollController mCameraEnrollService;
@@ -168,7 +173,7 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         mSharedUtil = new SharedUtil(this);
         SmartFaceEngine.currentEnrollPercent = 0f;
         SmartFaceEngine.currentEnrollStage = 0;
-        SmartFaceEngine.currentEnrollHint = "ضع وجهك داخل الإطار وانظر للأمام";
+        SmartFaceEngine.currentEnrollHint = "انظر نحو الكاميرا وحرّك رأسك ببطء";
 
         int bg = mIsDarkTheme ? Color.BLACK : Color.WHITE;
         getWindow().setStatusBarColor(bg);
@@ -242,17 +247,68 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         }
     };
 
+    private int getDisplayRotation() {
+        try {
+            if (getDisplay() != null) {
+                return getDisplay().getRotation();
+            }
+        } catch (Throwable ignored) {
+        }
+        return getWindowManager().getDefaultDisplay().getRotation();
+    }
+
+    private void positionCameraArrowGuide() {
+        if (mCameraArrowGuide == null) return;
+        int rot = getDisplayRotation();
+        mCameraArrowGuide.setDisplayRotation(rot);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        // في Galaxy Tab A7 (SM-T505N): الكاميرا في منتصف الحافة اليمنى في الوضع الطولي (ROTATION_0)
+        switch (rot) {
+            case Surface.ROTATION_90:
+                lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                lp.topMargin = dp(8);
+                break;
+            case Surface.ROTATION_180:
+                lp.gravity = Gravity.LEFT | Gravity.CENTER_VERTICAL;
+                lp.leftMargin = dp(8);
+                break;
+            case Surface.ROTATION_270:
+                lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                lp.bottomMargin = dp(8);
+                break;
+            default:
+                lp.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL;
+                lp.rightMargin = dp(8);
+                break;
+        }
+        mCameraArrowGuide.setLayoutParams(lp);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        positionCameraArrowGuide();
+    }
+
     private void init() {
         int bgColor = mIsDarkTheme ? Color.parseColor("#000000") : Color.parseColor("#FFFFFF");
         int primaryText = mIsDarkTheme ? Color.parseColor("#FFFFFF") : Color.parseColor("#000000");
         int appleBlue = mIsDarkTheme ? Color.parseColor("#0A84FF") : Color.parseColor("#007AFF");
 
+        mRootFrame = new FrameLayout(this);
+        mRootFrame.setBackgroundColor(bgColor);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(bgColor);
-        root.setPadding(dp(24), dp(20), dp(24), dp(32));
+        root.setPadding(dp(24), dp(18), dp(24), dp(28));
         root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
 
+        // الشريط العلوي
         FrameLayout topBar = new FrameLayout(this);
         topBar.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         TextView cancelBtn = new TextView(this);
@@ -267,6 +323,7 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         topBar.addView(cancelBtn, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END));
         root.addView(topBar);
 
+        // المحتوى الأوسط الكبير والواضح
         LinearLayout centerCol = new LinearLayout(this);
         centerCol.setOrientation(LinearLayout.VERTICAL);
         centerCol.setGravity(Gravity.CENTER);
@@ -278,7 +335,7 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         titleView.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         titleView.setTextColor(primaryText);
         titleView.setGravity(Gravity.CENTER);
-        titleView.setPadding(0, 0, 0, dp(6));
+        titleView.setPadding(0, 0, 0, dp(4));
         centerCol.addView(titleView);
 
         mStepCounterText = new TextView(this);
@@ -286,36 +343,48 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         mStepCounterText.setTextSize(14f);
         mStepCounterText.setTextColor(appleBlue);
         mStepCounterText.setGravity(Gravity.CENTER);
-        mStepCounterText.setPadding(0, 0, 0, dp(26));
+        mStepCounterText.setPadding(0, 0, 0, dp(22));
         centerCol.addView(mStepCounterText);
 
-        int ringSize = dp(284);
-        int camSize = dp(236);
+        // إطار الكاميرا الدائري الكبير (270dp) بدون أي زوايا مربعة أو إطار أسود سميك
+        int ringSize = dp(316);
+        int camSize = dp(270);
+        int maskSize = dp(274);
 
         FrameLayout scannerContainer = new FrameLayout(this);
         scannerContainer.setLayoutParams(new LinearLayout.LayoutParams(ringSize, ringSize));
 
         mSurface = new CircleSurfaceView(this);
         mSurface.setPercent(0f);
+        mSurface.setClipToOutline(true);
+        mSurface.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                outline.setOval(0, 0, view.getWidth(), view.getHeight());
+            }
+        });
         scannerContainer.addView(mSurface, new FrameLayout.LayoutParams(camSize, camSize, Gravity.CENTER));
 
-        CameraVignetteOverlayView vignetteView = new CameraVignetteOverlayView(this, bgColor, appleBlue);
-        scannerContainer.addView(vignetteView, new FrameLayout.LayoutParams(camSize, camSize, Gravity.CENTER));
+        // قناع صلب يغطي أي زوايا خارج الدائرة بلون الخلفية مع حافة زجاجية رفيعة جداً
+        CircularMaskOverlayView maskOverlay = new CircularMaskOverlayView(this, bgColor, appleBlue, camSize);
+        scannerContainer.addView(maskOverlay, new FrameLayout.LayoutParams(maskSize, maskSize, Gravity.CENTER));
 
         mTicksView = new AppleFaceIdRingView(this, mIsDarkTheme);
         scannerContainer.addView(mTicksView, new FrameLayout.LayoutParams(ringSize, ringSize, Gravity.CENTER));
 
         centerCol.addView(scannerContainer);
 
+        // نص التوجيه الحي
         mFaceEnrollMsg = new TextView(this);
         mFaceEnrollMsg.setText(SmartFaceEngine.currentEnrollHint);
         mFaceEnrollMsg.setTextSize(18f);
         mFaceEnrollMsg.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         mFaceEnrollMsg.setTextColor(primaryText);
         mFaceEnrollMsg.setGravity(Gravity.CENTER);
-        mFaceEnrollMsg.setPadding(dp(12), dp(28), dp(12), dp(18));
+        mFaceEnrollMsg.setPadding(dp(12), dp(24), dp(12), dp(16));
         centerCol.addView(mFaceEnrollMsg);
 
+        // مؤشر المراحل الـ 5
         LinearLayout pillsRow = new LinearLayout(this);
         pillsRow.setOrientation(LinearLayout.HORIZONTAL);
         pillsRow.setGravity(Gravity.CENTER);
@@ -330,7 +399,14 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         centerCol.addView(pillsRow);
 
         root.addView(centerCol);
-        setContentView(root);
+        mRootFrame.addView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // مؤشر الأسهم الصغيرة بجانب مكان الكاميرا الفعلي في الجهاز (يتكيف مع دوران الشاشة)
+        mCameraArrowGuide = new CameraEdgeArrowGuideView(this, mIsDarkTheme);
+        mRootFrame.addView(mCameraArrowGuide);
+        positionCameraArrowGuide();
+
+        setContentView(mRootFrame);
         syncProgressUi();
 
         mSurface.postDelayed(new Runnable() {
@@ -362,6 +438,9 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         }
         if (mTicksView != null) {
             mTicksView.updateState(pct, stage);
+        }
+        if (mCameraArrowGuide != null) {
+            mCameraArrowGuide.setEnrollStage(stage);
         }
         if (mFaceEnrollMsg != null) {
             mFaceEnrollMsg.setText(SmartFaceEngine.currentEnrollHint);
@@ -402,34 +481,195 @@ public class FaceEnrollActivity extends FaceBaseActivity {
         return (int) (val * getResources().getDisplayMetrics().density);
     }
 
-    private static class CameraVignetteOverlayView extends View {
-        private final Paint vignettePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint framePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final int bgColor;
+    /**
+     * قناع دائري صلب بتقنية EVEN_ODD يخفي تماماً أي زوايا مربعة للـ SurfaceView دون تضييق الكاميرا
+     */
+    private static class CircularMaskOverlayView extends View {
+        private final Paint maskPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint rimPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path clipPath = new Path();
+        private final float circleDiameter;
 
-        CameraVignetteOverlayView(Context ctx, int bgColor, int accentColor) {
+        CircularMaskOverlayView(Context ctx, int bgColor, int accentColor, float circleDiameter) {
             super(ctx);
-            this.bgColor = bgColor;
-            framePaint.setColor(Color.argb(70, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor)));
-            framePaint.setStyle(Paint.Style.STROKE);
-            framePaint.setStrokeWidth(1.5f * ctx.getResources().getDisplayMetrics().density);
+            this.circleDiameter = circleDiameter;
+            maskPaint.setColor(bgColor);
+            maskPaint.setStyle(Paint.Style.FILL);
+            clipPath.setFillType(Path.FillType.EVEN_ODD);
+
+            rimPaint.setColor(Color.argb(95, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor)));
+            rimPaint.setStyle(Paint.Style.STROKE);
+            rimPaint.setStrokeWidth(1.5f * ctx.getResources().getDisplayMetrics().density);
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            float cx = getWidth() * 0.5f;
-            float cy = getHeight() * 0.5f;
-            float r = Math.min(cx, cy);
+            float w = getWidth();
+            float h = getHeight();
+            float cx = w * 0.5f;
+            float cy = h * 0.5f;
+            float r = circleDiameter * 0.5f;
 
-            vignettePaint.setShader(new RadialGradient(
-                    cx, cy, r,
-                    new int[]{Color.TRANSPARENT, Color.TRANSPARENT, bgColor},
-                    new float[]{0f, 0.84f, 1.0f},
-                    Shader.TileMode.CLAMP
-            ));
-            canvas.drawCircle(cx, cy, r, vignettePaint);
-            canvas.drawCircle(cx, cy, r * 0.90f, framePaint);
+            clipPath.reset();
+            clipPath.addRect(0f, 0f, w, h, Path.Direction.CW);
+            clipPath.addCircle(cx, cy, r, Path.Direction.CW);
+            canvas.drawPath(clipPath, maskPaint);
+
+            canvas.drawCircle(cx, cy, r, rimPaint);
+        }
+    }
+
+    /**
+     * مؤشر أسهم صغير يظهر مباشرة بجانب الكاميرا الأمامية في التابلت
+     * ليوجّه نظرك وحركة وجهك أثناء التسجيل في جميع أوضاع دوران الشاشة
+     */
+    private static class CameraEdgeArrowGuideView extends View {
+        private final Paint pillBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint pillStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final int blueColor;
+        private final int greenColor;
+        private int stage = 0;
+        private int displayRotation = Surface.ROTATION_0;
+        private float pulsePhase = 0f;
+        private ValueAnimator pulseAnim;
+
+        CameraEdgeArrowGuideView(Context ctx, boolean dark) {
+            super(ctx);
+            float d = ctx.getResources().getDisplayMetrics().density;
+            blueColor = dark ? Color.parseColor("#0A84FF") : Color.parseColor("#007AFF");
+            greenColor = dark ? Color.parseColor("#30D158") : Color.parseColor("#34C759");
+
+            pillBgPaint.setColor(dark ? Color.parseColor("#E614161B") : Color.parseColor("#F0F2F2F7"));
+            pillBgPaint.setStyle(Paint.Style.FILL);
+
+            pillStrokePaint.setColor(dark ? Color.parseColor("#330A84FF") : Color.parseColor("#33007AFF"));
+            pillStrokePaint.setStyle(Paint.Style.STROKE);
+            pillStrokePaint.setStrokeWidth(1.2f * d);
+
+            arrowPaint.setColor(blueColor);
+            arrowPaint.setStyle(Paint.Style.STROKE);
+            arrowPaint.setStrokeCap(Paint.Cap.ROUND);
+            arrowPaint.setStrokeJoin(Paint.Join.ROUND);
+            arrowPaint.setStrokeWidth(2.4f * d);
+
+            dotPaint.setColor(blueColor);
+            dotPaint.setStyle(Paint.Style.FILL);
+
+            pulseAnim = ValueAnimator.ofFloat(0f, 1f);
+            pulseAnim.setDuration(900L);
+            pulseAnim.setRepeatCount(ValueAnimator.INFINITE);
+            pulseAnim.setRepeatMode(ValueAnimator.REVERSE);
+            pulseAnim.setInterpolator(new LinearInterpolator());
+            pulseAnim.addUpdateListener(a -> {
+                pulsePhase = (float) a.getAnimatedValue();
+                invalidate();
+            });
+            pulseAnim.start();
+        }
+
+        void setEnrollStage(int stage) {
+            if (this.stage != stage) {
+                this.stage = stage;
+                invalidate();
+            }
+        }
+
+        void setDisplayRotation(int rotation) {
+            if (this.displayRotation != rotation) {
+                this.displayRotation = rotation;
+                requestLayout();
+                invalidate();
+            }
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            float d = getResources().getDisplayMetrics().density;
+            boolean horizontalPill = (displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270);
+            int w = (int) ((horizontalPill ? 92f : 42f) * d);
+            int h = (int) ((horizontalPill ? 42f : 92f) * d);
+            setMeasuredDimension(w, h);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float d = getResources().getDisplayMetrics().density;
+            float w = getWidth();
+            float h = getHeight();
+            float r = Math.min(w, h) * 0.5f;
+
+            RectF box = new RectF(1f * d, 1f * d, w - 1f * d, h - 1f * d);
+            canvas.drawRoundRect(box, r, r, pillBgPaint);
+            canvas.drawRoundRect(box, r, r, pillStrokePaint);
+
+            float cx = w * 0.5f;
+            float cy = h * 0.5f;
+            float shift = (pulsePhase - 0.5f) * 5f * d;
+
+            if (stage >= 5) {
+                arrowPaint.setColor(greenColor);
+                Path check = new Path();
+                check.moveTo(cx - 7f * d, cy);
+                check.lineTo(cx - 2f * d, cy + 5f * d);
+                check.lineTo(cx + 8f * d, cy - 6f * d);
+                canvas.drawPath(check, arrowPaint);
+                return;
+            }
+
+            arrowPaint.setColor(blueColor);
+            dotPaint.setColor(blueColor);
+
+            switch (stage) {
+                case 0:
+                    // نقطة تركيز نابضة تشير للنظر مباشرة للكاميرا
+                    dotPaint.setAlpha((int) (140 + 115 * pulsePhase));
+                    canvas.drawCircle(cx, cy, (4.5f + 2.0f * pulsePhase) * d, dotPaint);
+                    canvas.drawCircle(cx, cy, 10f * d, pillStrokePaint);
+                    break;
+                case 1:
+                    // أسهم تشير لليمين
+                    drawChevron(canvas, cx - 3f * d + shift, cy, 6f * d, 0f);
+                    drawChevron(canvas, cx + 6f * d + shift, cy, 6f * d, 0f);
+                    break;
+                case 2:
+                    // أسهم تشير لليسار
+                    drawChevron(canvas, cx + 3f * d - shift, cy, 6f * d, 180f);
+                    drawChevron(canvas, cx - 6f * d - shift, cy, 6f * d, 180f);
+                    break;
+                case 3:
+                    // أسهم تشير للأعلى
+                    drawChevron(canvas, cx, cy + 3f * d - shift, 6f * d, -90f);
+                    drawChevron(canvas, cx, cy - 6f * d - shift, 6f * d, -90f);
+                    break;
+                case 4:
+                    // أسهم تشير للأسفل
+                    drawChevron(canvas, cx, cy - 3f * d + shift, 6f * d, 90f);
+                    drawChevron(canvas, cx, cy + 6f * d + shift, 6f * d, 90f);
+                    break;
+            }
+        }
+
+        private void drawChevron(Canvas canvas, float cx, float cy, float size, float angleDeg) {
+            canvas.save();
+            canvas.rotate(angleDeg, cx, cy);
+            Path p = new Path();
+            p.moveTo(cx - size * 0.45f, cy - size * 0.75f);
+            p.lineTo(cx + size * 0.45f, cy);
+            p.lineTo(cx - size * 0.45f, cy + size * 0.75f);
+            canvas.drawPath(p, arrowPaint);
+            canvas.restore();
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            if (pulseAnim != null) {
+                pulseAnim.cancel();
+            }
         }
     }
 

@@ -22,9 +22,11 @@ import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import androidx.core.content.getSystemService
@@ -43,26 +45,11 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
 
     private var windowManager: WindowManager? = null
 
-    private var islandView: DynamicFaceIslandView? = null
-    private var islandAdded: Boolean = false
-    private val islandParams = WindowManager.LayoutParams(
-        WindowManager.LayoutParams.WRAP_CONTENT,
-        WindowManager.LayoutParams.WRAP_CONTENT,
-        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
-        PixelFormat.TRANSLUCENT
-    ).apply {
-        gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        y = 0
-        screenBrightness = -1.0f
-    }
-
-    private var glowView: SoftEdgeGlowView? = null
-    private var glowAdded: Boolean = false
-    private val glowParams = WindowManager.LayoutParams(
+    // 1. لوحة الإضاءة البيضاء الناعمة الشفافة (تظهر وترتفع إضاءتها بسلاسة في الظلام الدامس فقط)
+    private var fillLightView: NightFillLightPanelView? = null
+    private var fillLightAdded: Boolean = false
+    private var fillLightAnimator: ValueAnimator? = null
+    private val fillLightParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -73,7 +60,26 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         PixelFormat.TRANSLUCENT
     ).apply {
         gravity = Gravity.CENTER
-        screenBrightness = 0.78f
+        screenBrightness = -1.0f
+    }
+
+    // 2. نتوء قطرة الماء (Waterdrop Notch) بلون أسود AMOLED ينسحب من حافة الكاميرا في كل الاتجاهات
+    private var notchView: WaterdropCameraNotchView? = null
+    private var notchAdded: Boolean = false
+    private val notchParams = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                or WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+        PixelFormat.TRANSLUCENT
+    ).apply {
+        gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+        x = 0
+        y = 0
+        screenBrightness = -1.0f
     }
 
     private var active: Boolean = false
@@ -85,6 +91,9 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
     private var handler: Handler? = null
+
+    private var showStartTimeMs: Long = 0L
+    private var darkReadingsCount: Int = 0
 
     private lateinit var serviceJob: Job
     private lateinit var serviceScope: CoroutineScope
@@ -229,18 +238,45 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
+    private fun getCurrentDisplayRotation(): Int {
+        return try {
+            displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
+        } catch (_: Exception) {
+            Surface.ROTATION_0
+        }
+    }
+
+    /**
+     * تحديد الحافة التي تقع بها الكاميرا الأمامية في Galaxy Tab A7 (SM-T505N) حسب دوران الشاشة:
+     * - ROTATION_0 (طولي): الحافة اليمنى (Gravity.RIGHT)
+     * - ROTATION_90 (أفقي): الحافة العلوية (Gravity.TOP)
+     * - ROTATION_180 (طولي مقلوب): الحافة اليسرى (Gravity.LEFT)
+     * - ROTATION_270 (أفقي مقلوب): الحافة السفلية (Gravity.BOTTOM)
+     */
+    private fun getCameraEdgeForRotation(rotation: Int): CameraEdge {
+        return when (rotation) {
+            Surface.ROTATION_90 -> CameraEdge.TOP
+            Surface.ROTATION_180 -> CameraEdge.LEFT
+            Surface.ROTATION_270 -> CameraEdge.BOTTOM
+            else -> CameraEdge.RIGHT
+        }
+    }
+
     private fun show() {
         if (active) return
         if (!Util.isFaceUnlockEnrolled(this)) return
 
         active = true
+        showStartTimeMs = System.currentTimeMillis()
+        darkReadingsCount = 0
+
         lightSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
 
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
         if (smartPrefs.getBoolean(SmartFaceEngine.KEY_CAPSULE_ANIM, true)) {
-            showDynamicIsland()
+            showWaterdropNotch()
         }
 
         handler?.removeCallbacks(autoTimeoutRunnable)
@@ -252,19 +288,19 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
     private fun hide(animated: Boolean) {
         handler?.removeCallbacks(autoTimeoutRunnable)
         sensorManager?.unregisterListener(this)
-        removeGlowOverlay()
+        hideFillLightPanel(animated)
 
         if (active) {
             active = false
             controller?.stop()
         }
 
-        if (animated && islandAdded && islandView != null) {
-            islandView?.animateOut {
-                removeIslandOverlay()
+        if (animated && notchAdded && notchView != null) {
+            notchView?.retractIntoBezel {
+                removeNotchOverlay()
             }
         } else {
-            removeIslandOverlay()
+            removeNotchOverlay()
         }
     }
 
@@ -275,68 +311,141 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             active = false
             controller?.stop()
         }
-        removeGlowOverlay()
-        removeIslandOverlay()
+        hideFillLightPanel(animated = false)
+        removeNotchOverlay()
     }
 
-    private fun showDynamicIsland() {
-        removeIslandOverlay()
+    private fun showWaterdropNotch() {
+        removeNotchOverlay()
         try {
-            val view = DynamicFaceIslandView(this)
-            islandView = view
-            windowManager?.addView(view, islandParams)
-            islandAdded = true
-            view.animateIn()
+            val edge = getCameraEdgeForRotation(getCurrentDisplayRotation())
+            notchParams.gravity = when (edge) {
+                CameraEdge.TOP -> Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                CameraEdge.BOTTOM -> Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                CameraEdge.LEFT -> Gravity.LEFT or Gravity.CENTER_VERTICAL
+                CameraEdge.RIGHT -> Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            }
+            notchParams.x = 0
+            notchParams.y = 0
+
+            val view = WaterdropCameraNotchView(this, edge)
+            notchView = view
+            windowManager?.addView(view, notchParams)
+            notchAdded = true
+            view.pullFromBezel()
         } catch (_: Exception) {
         }
     }
 
-    private fun removeIslandOverlay() {
-        if (islandAdded) {
+    private fun removeNotchOverlay() {
+        if (notchAdded) {
             try {
-                islandView?.stopAnimators()
-                windowManager?.removeView(islandView)
+                notchView?.stopAnimators()
+                windowManager?.removeView(notchView)
             } catch (_: Exception) {
             }
-            islandView = null
-            islandAdded = false
+            notchView = null
+            notchAdded = false
         }
     }
 
-    private fun showGlowOverlay() {
-        if (glowAdded) return
+    /**
+     * لوحة بيضاء ناعمة شفافة ترتفع إضاءتها وسطوع الشاشة بسلاسة في الظلام الدامس فقط
+     */
+    private fun showSmoothNightFillLight() {
+        if (fillLightAdded) return
         try {
-            val view = SoftEdgeGlowView(this)
-            glowView = view
-            windowManager?.addView(view, glowParams)
-            glowAdded = true
+            val view = NightFillLightPanelView(this)
+            fillLightView = view
+            fillLightParams.screenBrightness = 0.05f
             view.alpha = 0f
-            view.animate().alpha(1f).setDuration(220).start()
+            windowManager?.addView(view, fillLightParams)
+            fillLightAdded = true
+
+            fillLightAnimator?.cancel()
+            fillLightAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 420L
+                interpolator = DecelerateInterpolator()
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    if (fillLightAdded && fillLightView != null) {
+                        fillLightView?.alpha = t * 0.86f
+                        fillLightParams.screenBrightness = 0.05f + (0.87f * t)
+                        try {
+                            windowManager?.updateViewLayout(fillLightView, fillLightParams)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                start()
+            }
         } catch (_: Exception) {
         }
     }
 
-    private fun removeGlowOverlay() {
-        if (glowAdded) {
+    private fun hideFillLightPanel(animated: Boolean) {
+        fillLightAnimator?.cancel()
+        if (!fillLightAdded) return
+
+        if (animated && fillLightView != null) {
+            val startAlpha = fillLightView?.alpha ?: 0.86f
+            val startBright = fillLightParams.screenBrightness.coerceAtLeast(0.05f)
+            fillLightAnimator = ValueAnimator.ofFloat(1f, 0f).apply {
+                duration = 240L
+                addUpdateListener { anim ->
+                    val t = anim.animatedValue as Float
+                    if (fillLightAdded && fillLightView != null) {
+                        fillLightView?.alpha = startAlpha * t
+                        fillLightParams.screenBrightness = if (t <= 0.05f) -1.0f else (startBright * t)
+                        try {
+                            windowManager?.updateViewLayout(fillLightView, fillLightParams)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        removeFillLightImmediately()
+                    }
+                })
+                start()
+            }
+        } else {
+            removeFillLightImmediately()
+        }
+    }
+
+    private fun removeFillLightImmediately() {
+        if (fillLightAdded) {
             try {
-                windowManager?.removeView(glowView)
+                fillLightParams.screenBrightness = -1.0f
+                windowManager?.removeView(fillLightView)
             } catch (_: Exception) {
             }
-            glowView = null
-            glowAdded = false
+            fillLightView = null
+            fillLightAdded = false
         }
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (!active || event?.sensor?.type != Sensor.TYPE_LIGHT) return
+
+        // تجاهل أول 160ms من استقرار المستشعر لمنع أي قراءة صفرية كاذبة في الغرفة المضيئة
+        if (System.currentTimeMillis() - showStartTimeMs < 160L) return
+
         val lux = event.values.firstOrNull() ?: 100f
         val smartPrefs = getSharedPreferences(SmartFaceEngine.PREFS_NAME, Context.MODE_PRIVATE)
-        val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, false)
+        val nightLightEnabled = smartPrefs.getBoolean(SmartFaceEngine.KEY_NIGHT_LIGHT, true)
 
-        if (nightLightEnabled && lux < 12f) {
-            showGlowOverlay()
+        if (nightLightEnabled && lux < 8.0f) {
+            darkReadingsCount++
+            // تأكيد قراءتين متتاليتين في الظلام الفعلي قبل تشغيل اللوحة البيضاء الناعمة
+            if (darkReadingsCount >= 2) {
+                showSmoothNightFillLight()
+            }
         } else {
-            removeGlowOverlay()
+            darkReadingsCount = 0
+            hideFillLightPanel(animated = true)
         }
     }
 
@@ -373,15 +482,15 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         handler?.post {
             handler?.removeCallbacks(autoTimeoutRunnable)
             sensorManager?.unregisterListener(this)
-            removeGlowOverlay()
+            hideFillLightPanel(animated = true)
             active = false
 
-            if (islandAdded && islandView != null) {
-                islandView?.showSuccessAndRetract {
-                    removeIslandOverlay()
+            if (notchAdded && notchView != null) {
+                notchView?.showSuccessAndRetract {
+                    removeNotchOverlay()
                 }
             } else {
-                removeIslandOverlay()
+                removeNotchOverlay()
             }
         }
     }
@@ -392,19 +501,51 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
         }
     }
 
-    private class DynamicFaceIslandView(ctx: Context) : View(ctx) {
-        private val density = ctx.resources.displayMetrics.density
-        private val pillW = (148f * density).toInt()
-        private val pillH = (38f * density).toInt()
+    private enum class CameraEdge {
+        TOP, BOTTOM, LEFT, RIGHT
+    }
 
-        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#0A0C10")
-            style = Paint.Style.FILL
+    /**
+     * لوحة إضاءة بيضاء ناعمة شفافة قليلاً تضيء الوجه بنعومة في الظلام الدامس فقط
+     */
+    private class NightFillLightPanelView(ctx: Context) : View(ctx) {
+        private val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val cx = w * 0.5f
+            val cy = h * 0.5f
+            val radius = maxOf(w, h) * 0.78f
+
+            // لوحة بيضاء ناعمة متجانسة بشفافية خفيفة في المركز وسطوع أعلى نحو الأطراف لإضاءة الوجه بوضوح
+            panelPaint.shader = RadialGradient(
+                cx, cy, radius,
+                intArrayOf(
+                    Color.argb(155, 250, 252, 255),
+                    Color.argb(205, 255, 255, 255),
+                    Color.argb(235, 255, 255, 255)
+                ),
+                floatArrayOf(0.0f, 0.55f, 1.0f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawRect(0f, 0f, w, h, panelPaint)
         }
-        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#2A303E")
-            style = Paint.Style.STROKE
-            strokeWidth = 1.1f * density
+    }
+
+    /**
+     * نتوء قطرة الماء (Waterdrop Notch) بلون أسود AMOLED (#000000) ينسحب بسلاسة من حافة الكاميرا
+     * ويتكيف ما بداخله مع دوران الشاشة الأربعة حتى لا يكون معكوساً أبداً
+     */
+    private class WaterdropCameraNotchView(ctx: Context, private val edge: CameraEdge) : View(ctx) {
+        private val density = ctx.resources.displayMetrics.density
+        private val spanPx = (146f * density).toInt()
+        private val maxDepthPx = (40f * density).toInt()
+
+        private val amoledBlackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
         }
         private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#0A84FF")
@@ -413,36 +554,36 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             strokeJoin = Paint.Join.ROUND
             strokeWidth = 2.0f * density
         }
-        private val scanBeamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#660A84FF")
+        private val beamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#880A84FF")
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
             strokeWidth = 1.6f * density
         }
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#F5F7FA")
-            textSize = 12.5f * density
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            textAlign = Paint.Align.CENTER
-        }
 
-        private val clipPath = Path()
+        private val notchPath = Path()
+        private var pullProgress = 0f
         private var scanPhase = 0f
         private var isSuccess = false
         private var successProgress = 0f
         private var scanAnimator: ValueAnimator? = null
+        private var pullAnimator: ValueAnimator? = null
 
         init {
             startScanLoop()
         }
 
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            setMeasuredDimension(pillW, pillH)
+            if (edge == CameraEdge.TOP || edge == CameraEdge.BOTTOM) {
+                setMeasuredDimension(spanPx, maxDepthPx)
+            } else {
+                setMeasuredDimension(maxDepthPx, spanPx)
+            }
         }
 
         private fun startScanLoop() {
             scanAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 1100L
+                duration = 1050L
                 repeatCount = ValueAnimator.INFINITE
                 repeatMode = ValueAnimator.REVERSE
                 interpolator = LinearInterpolator()
@@ -454,19 +595,17 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             }
         }
 
-        fun animateIn() {
-            pivotX = pillW * 0.5f
-            pivotY = 0f
-            scaleX = 0.42f
-            scaleY = 0f
-            alpha = 0f
-            animate()
-                .scaleX(1f)
-                .scaleY(1f)
-                .alpha(1f)
-                .setDuration(300L)
-                .setInterpolator(PathInterpolator(0.22f, 1.0f, 0.36f, 1.0f))
-                .start()
+        fun pullFromBezel() {
+            pullAnimator?.cancel()
+            pullAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 340L
+                interpolator = PathInterpolator(0.22f, 1.0f, 0.36f, 1.0f)
+                addUpdateListener {
+                    pullProgress = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
         }
 
         fun showSuccessAndRetract(onDone: () -> Unit) {
@@ -474,91 +613,181 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             isSuccess = true
             iconPaint.color = Color.parseColor("#30D158")
             ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 180L
+                duration = 170L
                 addUpdateListener {
                     successProgress = it.animatedValue as Float
                     invalidate()
                 }
                 addListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) {
-                        postDelayed({ animateOut(onDone) }, 140L)
+                        postDelayed({ retractIntoBezel(onDone) }, 140L)
                     }
                 })
                 start()
             }
         }
 
-        fun animateOut(onDone: () -> Unit) {
+        fun retractIntoBezel(onDone: () -> Unit) {
             scanAnimator?.cancel()
-            pivotX = pillW * 0.5f
-            pivotY = 0f
-            animate()
-                .scaleX(0.42f)
-                .scaleY(0f)
-                .alpha(0f)
-                .setDuration(210L)
-                .setInterpolator(PathInterpolator(0.4f, 0f, 1f, 1f))
-                .setListener(object : AnimatorListenerAdapter() {
+            pullAnimator?.cancel()
+            pullAnimator = ValueAnimator.ofFloat(pullProgress, 0f).apply {
+                duration = 230L
+                interpolator = PathInterpolator(0.4f, 0f, 1f, 1f)
+                addUpdateListener {
+                    pullProgress = it.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) {
                         onDone()
                     }
                 })
-                .start()
+                start()
+            }
         }
 
         fun stopAnimators() {
             scanAnimator?.cancel()
-            animate().cancel()
+            pullAnimator?.cancel()
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
+            if (pullProgress <= 0.01f) return
+
             val w = width.toFloat()
             val h = height.toFloat()
-            val bottomR = h * 0.50f
+            val depth = maxDepthPx * pullProgress
+            val spanScale = 0.62f + 0.38f * pullProgress
 
-            clipPath.reset()
-            clipPath.addRoundRect(
-                RectF(0f, 0f, w, h),
-                floatArrayOf(0f, 0f, 0f, 0f, bottomR, bottomR, bottomR, bottomR),
-                Path.Direction.CW
-            )
-            canvas.drawPath(clipPath, bgPaint)
-            canvas.drawPath(clipPath, borderPaint)
+            notchPath.reset()
+            var iconCx = w * 0.5f
+            var iconCy = h * 0.5f
 
-            val iconSize = 18f * density
-            val iconLeft = 18f * density
-            val iconTop = (h - iconSize) * 0.5f
-
-            if (isSuccess) {
-                val p = Path().apply {
-                    moveTo(iconLeft + iconSize * 0.18f, iconTop + iconSize * 0.52f)
-                    lineTo(iconLeft + iconSize * 0.42f, iconTop + iconSize * 0.76f)
-                    if (successProgress > 0.4f) {
-                        val t = ((successProgress - 0.4f) / 0.6f).coerceIn(0f, 1f)
-                        lineTo(
-                            iconLeft + iconSize * (0.42f + 0.42f * t),
-                            iconTop + iconSize * (0.76f - 0.50f * t)
-                        )
-                    }
+            when (edge) {
+                CameraEdge.TOP -> {
+                    val halfSpan = (w * spanScale) * 0.5f
+                    val startX = w * 0.5f - halfSpan
+                    val endX = w * 0.5f + halfSpan
+                    val spanW = endX - startX
+                    notchPath.moveTo(startX, 0f)
+                    notchPath.cubicTo(
+                        startX + spanW * 0.22f, 0f,
+                        startX + spanW * 0.27f, depth,
+                        w * 0.5f, depth
+                    )
+                    notchPath.cubicTo(
+                        endX - spanW * 0.27f, depth,
+                        endX - spanW * 0.22f, 0f,
+                        endX, 0f
+                    )
+                    notchPath.close()
+                    iconCx = w * 0.5f
+                    iconCy = depth * 0.48f
                 }
-                canvas.drawPath(p, iconPaint)
-                val fontMetrics = textPaint.fontMetrics
-                val textY = h * 0.5f - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
-                canvas.drawText("تم الفتح", w * 0.58f, textY, textPaint)
-            } else {
-                drawMiniFaceId(canvas, iconLeft, iconTop, iconSize)
-                val beamY = iconTop + iconSize * (0.15f + 0.70f * scanPhase)
-                canvas.drawLine(iconLeft + 2f * density, beamY, iconLeft + iconSize - 2f * density, beamY, scanBeamPaint)
 
-                val fontMetrics = textPaint.fontMetrics
-                val textY = h * 0.5f - (fontMetrics.ascent + fontMetrics.descent) * 0.5f
-                canvas.drawText("جاري التحقق", w * 0.58f, textY, textPaint)
+                CameraEdge.BOTTOM -> {
+                    val halfSpan = (w * spanScale) * 0.5f
+                    val startX = w * 0.5f - halfSpan
+                    val endX = w * 0.5f + halfSpan
+                    val spanW = endX - startX
+                    val apexY = h - depth
+                    notchPath.moveTo(startX, h)
+                    notchPath.cubicTo(
+                        startX + spanW * 0.22f, h,
+                        startX + spanW * 0.27f, apexY,
+                        w * 0.5f, apexY
+                    )
+                    notchPath.cubicTo(
+                        endX - spanW * 0.27f, apexY,
+                        endX - spanW * 0.22f, h,
+                        endX, h
+                    )
+                    notchPath.close()
+                    iconCx = w * 0.5f
+                    iconCy = h - depth * 0.48f
+                }
+
+                CameraEdge.RIGHT -> {
+                    val halfSpan = (h * spanScale) * 0.5f
+                    val startY = h * 0.5f - halfSpan
+                    val endY = h * 0.5f + halfSpan
+                    val spanH = endY - startY
+                    val apexX = w - depth
+                    notchPath.moveTo(w, startY)
+                    notchPath.cubicTo(
+                        w, startY + spanH * 0.22f,
+                        apexX, startY + spanH * 0.27f,
+                        apexX, h * 0.5f
+                    )
+                    notchPath.cubicTo(
+                        apexX, endY - spanH * 0.27f,
+                        w, endY - spanH * 0.22f,
+                        w, endY
+                    )
+                    notchPath.close()
+                    iconCx = w - depth * 0.48f
+                    iconCy = h * 0.5f
+                }
+
+                CameraEdge.LEFT -> {
+                    val halfSpan = (h * spanScale) * 0.5f
+                    val startY = h * 0.5f - halfSpan
+                    val endY = h * 0.5f + halfSpan
+                    val spanH = endY - startY
+                    notchPath.moveTo(0f, startY)
+                    notchPath.cubicTo(
+                        0f, startY + spanH * 0.22f,
+                        depth, startY + spanH * 0.27f,
+                        depth, h * 0.5f
+                    )
+                    notchPath.cubicTo(
+                        depth, endY - spanH * 0.27f,
+                        0f, endY - spanH * 0.22f,
+                        0f, endY
+                    )
+                    notchPath.close()
+                    iconCx = depth * 0.48f
+                    iconCy = h * 0.5f
+                }
+            }
+
+            // رسم النتوء باللون الأسود AMOLED الخالص (#000000) بدون أي إطار خارجي ليلتحم بحواف الشاشة
+            canvas.drawPath(notchPath, amoledBlackPaint)
+
+            // رسم أيقونة Face ID داخل النتوء دائماً بوضع مستقيم يتكيف مع اتجاه الشاشة الحالي
+            if (pullProgress > 0.45f) {
+                val contentAlpha = (((pullProgress - 0.45f) / 0.55f) * 255f).toInt().coerceIn(0, 255)
+                iconPaint.alpha = contentAlpha
+                beamPaint.alpha = (contentAlpha * 0.65f).toInt()
+
+                val iconSize = 18.5f * density
+                val iconLeft = iconCx - iconSize * 0.5f
+                val iconTop = iconCy - iconSize * 0.5f
+
+                if (isSuccess) {
+                    val p = Path().apply {
+                        moveTo(iconLeft + iconSize * 0.18f, iconTop + iconSize * 0.52f)
+                        lineTo(iconLeft + iconSize * 0.42f, iconTop + iconSize * 0.76f)
+                        if (successProgress > 0.4f) {
+                            val t = ((successProgress - 0.4f) / 0.6f).coerceIn(0f, 1f)
+                            lineTo(
+                                iconLeft + iconSize * (0.42f + 0.42f * t),
+                                iconTop + iconSize * (0.76f - 0.50f * t)
+                            )
+                        }
+                    }
+                    canvas.drawPath(p, iconPaint)
+                } else {
+                    drawMiniFaceId(canvas, iconLeft, iconTop, iconSize)
+                    val beamY = iconTop + iconSize * (0.15f + 0.70f * scanPhase)
+                    canvas.drawLine(iconLeft + 2f * density, beamY, iconLeft + iconSize - 2f * density, beamY, beamPaint)
+                }
             }
         }
 
         private fun drawMiniFaceId(canvas: Canvas, l: Float, t: Float, s: Float) {
-            val arm = s * 0.24f
+            val arm = s * 0.25f
             val r = s * 0.16f
             val right = l + s
             val bottom = t + s
@@ -583,31 +812,6 @@ class LockscreenFaceAuthService : AccessibilityService(), FaceAuthServiceCallbac
             canvas.drawLine(l + s * 0.35f, eyeY - s * 0.05f, l + s * 0.35f, eyeY + s * 0.05f, iconPaint)
             canvas.drawLine(l + s * 0.65f, eyeY - s * 0.05f, l + s * 0.65f, eyeY + s * 0.05f, iconPaint)
             canvas.drawArc(RectF(l + s * 0.36f, t + s * 0.48f, l + s * 0.64f, t + s * 0.68f), 25f, 130f, false, iconPaint)
-        }
-    }
-
-    private class SoftEdgeGlowView(ctx: Context) : View(ctx) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val w = width.toFloat()
-            val h = height.toFloat()
-            val cx = w * 0.5f
-            val cy = h * 0.5f
-            val radius = maxOf(w, h) * 0.72f
-
-            paint.shader = RadialGradient(
-                cx, cy, radius,
-                intArrayOf(
-                    Color.TRANSPARENT,
-                    Color.argb(35, 255, 255, 255),
-                    Color.argb(190, 255, 255, 255)
-                ),
-                floatArrayOf(0.55f, 0.82f, 1.0f),
-                Shader.TileMode.CLAMP
-            )
-            canvas.drawRect(0f, 0f, w, h, paint)
         }
     }
 

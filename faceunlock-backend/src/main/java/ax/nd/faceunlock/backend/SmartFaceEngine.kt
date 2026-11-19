@@ -32,14 +32,12 @@ class SmartFaceEngine(context: Context) {
         const val PREFS_NAME = "smart_face_prefs"
         private const val KEY_CACHED_ROTATION = "cached_camera_rotation"
 
-        // مفاتيح تجربة الاستخدام الذكية
         const val KEY_REQUIRE_EYES = "req_eyes_open"
         const val KEY_ADAPTIVE = "adaptive_learning"
         const val KEY_NIGHT_LIGHT = "night_fill_light"
         const val KEY_UNLOCK_CHIME = "unlock_chime_sound"
         const val KEY_CAPSULE_ANIM = "dynamic_capsule_anim"
 
-        // معايرة دقيقة لكاميرا التابلت (سرعة فائقة + حماية 4 طبقات)
         private const val MATCH_COMBINED_THRESHOLD = 0.45f
         private const val MATCH_SINGLE_MAX_THRESHOLD = 0.49f
         private const val INSTANT_UNLOCK_THRESHOLD = 0.56f

@@ -258,18 +258,18 @@ class MainActivity : AppCompatActivity(), RemoveFaceControllerCallbacks {
         smartGroup.addView(createHairlineDivider())
 
         smartGroup.addView(createSmartToggleRow(
-            title = "كبسولة التعرّف التفاعلية",
-            subtitle = "مؤشر ديناميكي سلس ينبثق من أعلى الشاشة أثناء المسح",
+            title = "نتوء قطرة الماء بجانب الكاميرا",
+            subtitle = "مؤشر أسود AMOLED ينسحب بسلاسة من حافة الكاميرا أثناء المسح",
             key = SmartFaceEngine.KEY_CAPSULE_ANIM,
             defaultVal = true
         ))
         smartGroup.addView(createHairlineDivider())
 
         smartGroup.addView(createSmartToggleRow(
-            title = "إطار الإضاءة الناعم في الظلام",
-            subtitle = "إضاءة حواف الشاشة بنعومة تلقائياً في الظلام الدامس فقط",
+            title = "لوحة الإضاءة البيضاء في الظلام",
+            subtitle = "إضاءة بيضاء ناعمة ترتفع بسلاسة لإضاءة الوجه في الظلام الدامس فقط",
             key = SmartFaceEngine.KEY_NIGHT_LIGHT,
-            defaultVal = false
+            defaultVal = true
         ))
         smartGroup.addView(createHairlineDivider())
 
