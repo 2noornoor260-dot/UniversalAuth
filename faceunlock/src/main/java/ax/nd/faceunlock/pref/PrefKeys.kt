@@ -7,5 +7,4 @@ object PrefKeys {
     const val REQUIRE_PIN_ON_BOOT = "require_pin_on_boot"
     const val BYPASS_KEYGUARD = "bypass_keyguard"
     const val SHOW_STATUS_TEXT = "show_status_text"
-    const val FAILED_UNLOCK_ATTEMPTS = "failed_unlock_attempts"
 }

@@ -131,7 +131,7 @@ class LockscreenFaceAuthService :
         serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
 
         prefs = FaceApplication.getApp().prefs
-        controller = FaceAuthServiceController(this, prefs, this)
+        controller = FaceAuthServiceController(this, this)
         SmartFaceEngine.setFeedbackListener(this)
 
         windowManager = getSystemService()
@@ -161,7 +161,6 @@ class LockscreenFaceAuthService :
                             booted = true
                             reconfigureUnlockHook()
                         }
-                        prefs.failedUnlockAttempts.set(0)
                         forceImmediateCleanup()
                     }
                     Intent.ACTION_SCREEN_OFF -> {
