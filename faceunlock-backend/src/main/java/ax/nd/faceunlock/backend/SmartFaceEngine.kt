@@ -31,19 +31,19 @@ class SmartFaceEngine(context: Context) {
         private const val DB_FILE_NAME = "smart_face_templates_v3.enc"
         const val PREFS_NAME = "smart_face_prefs"
 
-        // مفاتيح تجربة الاستخدام
+        // مفاتيح تجربة الاستخدام الذكية
         const val KEY_REQUIRE_EYES = "req_eyes_open"
         const val KEY_ADAPTIVE = "adaptive_learning"
         const val KEY_NIGHT_LIGHT = "night_fill_light"
-        const val KEY_SHOW_LOCK_STATUS = "show_lock_status_text"
         const val KEY_UNLOCK_CHIME = "unlock_chime_sound"
 
-        // معايرة الأمان والسرعة
-        private const val OPTIMAL_MATCH_THRESHOLD = 0.56f
-        private const val OPTIMAL_SPOOF_THRESHOLD = 0.48f
-        private const val MIN_NOSE_PROTRUSION_3D = 0.14f
-        private const val MIN_SKIN_SHARPNESS = 18.0f
-        private const val OPTIMAL_MAX_HEAD_ANGLE = 30f
+        // معايرة دقيقة لكاميرا التابلت (سرعة عالية + حماية ثلاثية الأبعاد)
+        private const val OPTIMAL_MATCH_THRESHOLD = 0.50f
+        private const val HIGH_CONFIDENCE_INSTANT_THRESHOLD = 0.66f
+        private const val OPTIMAL_SPOOF_THRESHOLD = 0.38f
+        private const val MIN_NOSE_PROTRUSION_3D = 0.065f
+        private const val MIN_SKIN_SHARPNESS = 4.5f
+        private const val OPTIMAL_MAX_HEAD_ANGLE = 34f
 
         @JvmField var currentEnrollHint: String = "ضع وجهك داخل الإطار وانظر للأمام"
         @JvmField var currentEnrollPercent: Float = 0f
@@ -83,13 +83,12 @@ class SmartFaceEngine(context: Context) {
     private val enrolledTemplates = mutableListOf<FloatArray>()
     private var storageDir: File? = null
     private var encryptor: UnlockEncryptor? = null
-    private var workingRotationOverride: Int? = null
+    private var lastWorkingRotation: Int? = null
 
     private var enrollStage = 0
     private var stageSamples = 0
     private var stage1YawSign = 1f
 
-    // تتبع الاستمرارية الزمنية لمنع الصور الثابتة
     private var lastVerifiedEmbedding: FloatArray? = null
     private var lastVerifiedTimeMs: Long = 0L
 
@@ -98,7 +97,7 @@ class SmartFaceEngine(context: Context) {
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.18f)
+            .setMinFaceSize(0.16f)
             .build()
         faceDetector = FaceDetection.getClient(options)
 
@@ -167,11 +166,11 @@ class SmartFaceEngine(context: Context) {
 
         val face = faces[0]
         val faceRatio = face.boundingBox.width().toFloat() / bitmap.width.toFloat()
-        if (faceRatio < 0.18f) {
+        if (faceRatio < 0.16f) {
             currentEnrollHint = "اقترب قليلاً من الشاشة"
             return CODE_TOO_SMALL
         }
-        if (faceRatio > 0.90f) {
+        if (faceRatio > 0.92f) {
             currentEnrollHint = "ابتعد قليلاً عن الشاشة"
             return CODE_TOO_LARGE
         }
@@ -183,26 +182,26 @@ class SmartFaceEngine(context: Context) {
         val angleMatched = when (enrollStage) {
             0 -> {
                 currentEnrollHint = "انظر للأمام مباشرة بثبات"
-                abs(yaw) <= 13f && abs(pitch) <= 14f
+                abs(yaw) <= 14f && abs(pitch) <= 15f
             }
             1 -> {
                 currentEnrollHint = "أدر رأسك ببطء نحو اليمين"
-                if (abs(yaw) in 12f..38f) {
+                if (abs(yaw) in 11f..40f) {
                     if (stageSamples == 0) stage1YawSign = if (yaw >= 0) 1f else -1f
                     true
                 } else false
             }
             2 -> {
                 currentEnrollHint = "أدر رأسك ببطء نحو اليسار"
-                (yaw * -stage1YawSign) in 12f..38f
+                (yaw * -stage1YawSign) in 11f..40f
             }
             3 -> {
                 currentEnrollHint = "ارفع ذقنك قليلاً للأعلى"
-                pitch in 8f..32f
+                pitch in 7f..34f
             }
             4 -> {
                 currentEnrollHint = "اخفض ذقنك قليلاً للأسفل"
-                pitch in -32f..-8f
+                pitch in -34f..-7f
             }
             else -> true
         }
@@ -264,19 +263,19 @@ class SmartFaceEngine(context: Context) {
         if (requireEyesOpen) {
             val left = face.leftEyeOpenProbability ?: 1f
             val right = face.rightEyeOpenProbability ?: 1f
-            if (left < 0.52f || right < 0.52f) {
+            if (left < 0.48f || right < 0.48f) {
                 return CODE_EYES_CLOSED
             }
         }
 
         val alignedFace = alignAndCrop(bitmap, face, recInputSize)
 
-        // الطبقة 1: فحص حدة نسيج الجلد لمنع شاشات العرض والصور الباهتة
+        // الطبقة 1: فحص حدة نسيج الجلد لمنع الشاشات والصور الباهتة
         if (computeTextureSharpness(alignedFace) < MIN_SKIN_SHARPNESS) {
             return CODE_SPOOF_WARNING
         }
 
-        // تشغيل النماذج الثلاثة بالتوازي لأقصى سرعة ممكنة
+        // تشغيل النماذج الثلاثة بالتوازي لأقصى سرعة
         val meshFuture = aiExecutor.submit(Callable {
             runCatching {
                 Tasks.await(meshDetector.process(InputImage.fromBitmap(bitmap, 0)), 320, TimeUnit.MILLISECONDS)
@@ -323,27 +322,30 @@ class SmartFaceEngine(context: Context) {
         // مطابقة البصمة
         val bestScore = enrolledTemplates.maxOfOrNull { cosineSimilarity(currentEmbedding, it) } ?: 0f
         if (bestScore < OPTIMAL_MATCH_THRESHOLD) {
+            lastVerifiedEmbedding = null
             return CODE_MISMATCH
         }
 
-        // الطبقة 4: التحقق الزمني (إطاران متتاليان بحركة بشرية طبيعية لمنع الصور الثابتة)
+        // الطبقة 4: الفتح الفوري عند الثقة العالية جداً، أو التحقق عبر إطارين متتاليين عند الثقة المتوسطة
         val now = System.currentTimeMillis()
-        val prevEmb = lastVerifiedEmbedding
-        if (prevEmb == null || (now - lastVerifiedTimeMs) > 650L) {
-            lastVerifiedEmbedding = currentEmbedding
-            lastVerifiedTimeMs = now
-            return CODE_KEEP_STILL
+        if (bestScore < HIGH_CONFIDENCE_INSTANT_THRESHOLD) {
+            val prevEmb = lastVerifiedEmbedding
+            if (prevEmb == null || (now - lastVerifiedTimeMs) > 1200L) {
+                lastVerifiedEmbedding = currentEmbedding
+                lastVerifiedTimeMs = now
+                return CODE_KEEP_STILL
+            }
+            val frameToFrameSim = cosineSimilarity(currentEmbedding, prevEmb)
+            if (frameToFrameSim > 0.9997f) {
+                lastVerifiedEmbedding = null
+                return CODE_SPOOF_WARNING
+            }
         }
 
-        val frameToFrameSim = cosineSimilarity(currentEmbedding, prevEmb)
         lastVerifiedEmbedding = null
-        // الصورة الثابتة تماماً تعطي تطابقاً شبه مطابق (0.9995+) بينما الوجه الحي يتحرك برفق
-        if (frameToFrameSim > 0.9996f) {
-            return CODE_SPOOF_WARNING
-        }
 
-        // التعلّم التكيفي الذكي (تخزين الإضاءات والنظارات المختلفة)
-        if (adaptiveLearning && bestScore in 0.63f..0.87f) {
+        // التعلّم التكيفي الذكي
+        if (adaptiveLearning && bestScore in 0.60f..0.88f) {
             if (enrolledTemplates.size >= MAX_TEMPLATES) {
                 enrolledTemplates.removeAt(4)
             }
@@ -354,12 +356,11 @@ class SmartFaceEngine(context: Context) {
         return CODE_SUCCESS
     }
 
+    /**
+     * دعم تلقائي للوضع الطولي والأفقي على التابلت دون تعليق على زاوية واحدة
+     */
     private fun detectFastNV21(nv21: ByteArray, width: Int, height: Int, requestedRotation: Int): Pair<Bitmap?, List<Face>> {
-        val candidates = if (workingRotationOverride != null) {
-            listOf(workingRotationOverride!!)
-        } else {
-            listOf(requestedRotation, 270, 90, 0, 180).distinct()
-        }
+        val candidates = listOfNotNull(lastWorkingRotation, requestedRotation, 270, 90, 0, 180).distinct()
 
         for (rot in candidates) {
             val inputImage = InputImage.fromByteArray(nv21, width, height, rot, InputImage.IMAGE_FORMAT_NV21)
@@ -368,7 +369,7 @@ class SmartFaceEngine(context: Context) {
             }.getOrNull()
 
             if (!faces.isNullOrEmpty()) {
-                workingRotationOverride = rot
+                lastWorkingRotation = rot
                 val raw = fastNv21ToBitmap(nv21, width, height) ?: return Pair(null, emptyList())
                 val rotated = rotateBitmap(raw, rot)
                 return Pair(rotated, faces)
