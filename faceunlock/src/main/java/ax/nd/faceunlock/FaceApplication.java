@@ -13,9 +13,11 @@ import android.util.Log;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import ax.nd.faceunlock.backend.SmartFaceEngine;
 import ax.nd.faceunlock.pref.Prefs;
 import ax.nd.faceunlock.service.FacePPPreloader;
 import ax.nd.faceunlock.util.NotificationUtils;
+import ax.nd.faceunlock.util.SharedUtil;
 import ax.nd.faceunlock.util.Util;
 
 public class FaceApplication extends Application {
@@ -56,6 +58,7 @@ public class FaceApplication extends Application {
         }
         super.onCreate();
         mApp = this;
+        migrateLegacyFaceData();
         IntentFilter intentFilter = new IntentFilter();
         intentFilter.addAction(Intent.ACTION_USER_PRESENT);
         intentFilter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
@@ -67,6 +70,25 @@ public class FaceApplication extends Application {
         LibManager.INSTANCE.init(this);
         prefs = new Prefs(this);
         facePreloader = new FacePPPreloader(this);
+    }
+
+    /**
+     * ترحيل: بصمات الإصدارات السابقة (v6 وما قبل) محسوبة بمحاذاة مختلفة فلا تُطابَق بالمحرّك الجديد.
+     * تُحذف ويُمسح علم "مسجَّل" فتظهر للمستخدم حالة "لم يتم الإعداد" ويعيد التسجيل مرة واحدة.
+     * يجب أن يسبق Util.setFaceUnlockAvailable كي تُكتب الحالة الصحيحة.
+     */
+    private void migrateLegacyFaceData() {
+        try {
+            java.io.File faceDir = getDir("faceunlock_data", 0);
+            if (SmartFaceEngine.migrateLegacyFiles(faceDir)) {
+                SharedUtil sharedUtil = new SharedUtil(this);
+                sharedUtil.removeSharePreferences(AppConstants.SHARED_KEY_FACE_ID);
+                sharedUtil.removeSharePreferences(AppConstants.SHARED_KEY_ENROLL_TOKEN);
+                Log.w(TAG, "legacy face templates removed: re-enrollment required");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "legacy face data migration failed", e);
+        }
     }
 
     @Override

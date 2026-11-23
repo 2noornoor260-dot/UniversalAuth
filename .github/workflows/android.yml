@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [ "a15" ]
+    branches: [ "a15", "Cludwep" ]
   workflow_dispatch:
 
 jobs:
@@ -41,6 +41,13 @@ jobs:
         done
         ls -lh faceunlock-backend/src/main/assets/
 
+    - name: Validate AI model contracts
+      # يفشل البناء إن كان نموذج التعرّف مفقوداً أو غير متوافق. أما نموذج مكافحة التزييف فيُطبع تحذير بارز
+      # (ولا يفشل) ما لم تُعرَّف المتغيّر REQUIRE_NEURAL_PAD_MODEL=1 في إعدادات المستودع (Settings > Variables).
+      env:
+        REQUIRE_NEURAL_PAD_MODEL: ${{ vars.REQUIRE_NEURAL_PAD_MODEL }}
+      run: python3 tools/validate_models.py faceunlock-backend/src/main/assets
+
     - name: Copy XposedUtil source directly
       run: |
         git clone https://github.com/null-dev/XposedUtil.git /tmp/XposedUtil
@@ -51,6 +58,9 @@ jobs:
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
+
+    - name: Unit tests (verification session, ambient light, alignment, templates, animation math)
+      run: ./gradlew :faceunlock-backend:testDebugUnitTest :faceunlock:testDebugUnitTest
 
     - name: Build APKs
       run: ./gradlew :universalauth-xposed:assembleDebug :faceunlock:assembleDebug

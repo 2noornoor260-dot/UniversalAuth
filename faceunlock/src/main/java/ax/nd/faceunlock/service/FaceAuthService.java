@@ -39,30 +39,22 @@ import java.util.Random;
 
 @SuppressWarnings("SynchronizeOnNonFinalField")
 public class FaceAuthService extends Service {
-    private static final String ALARM_FAIL_TIMEOUT_LOCKOUT = "ax.nd.faceunlock.ACTION_LOCKOUT_RESET";
     private static final String ALARM_TIMEOUT_FREEZED = "ax.nd.faceunlock.freezedtimeout";
     private static final long DEFAULT_IDLE_TIMEOUT_MS = 3600000 * 4; // 4 hours
-    private static final long FAIL_LOCKOUT_TIMEOUT_MS = 30000; // 30 seconds
-    private static final int MAX_FAILED_ATTEMPTS_LOCKOUT_PERMANENT = 10;
-    private static final int MAX_FAILED_ATTEMPTS_LOCKOUT_TIMED = 5;
     private static final String TAG = FaceAuthService.class.getName();
     private AlarmManager mAlarmManager;
-    private Integer mAuthErrorCount = 0;
-    private Integer mAuthErrorThrottleCount = 0;
     private CameraFaceAuthController mCameraAuthController;
     private CameraFaceEnrollController mCameraEnrollController;
     private byte[] mEnrollToken;
     private FacePPImpl mFaceAuth;
     private PendingIntent mIdleTimeoutIntent;
     private boolean mOnIdleTimer;
+    // The idle timeout (no real unlock for DEFAULT_IDLE_TIMEOUT_MS) is the only lockout state left.
+    // Failed scans are never counted: there is no attempt-limit lockout.
     private Integer mLockoutType = LOCKOUT_TYPE_DISABLED;
     private static final int LOCKOUT_TYPE_DISABLED = 0;
-    private static final int LOCKOUT_TYPE_TIMED = 1;
-    private static final int LOCKOUT_TYPE_PERMANENT = 2;
     private static final int LOCKOUT_TYPE_IDLE = 3;
-    private PendingIntent mLockoutTimeoutIntent;
     private IFaceServiceReceiver mFaceReceiver;
-    private boolean mOnLockoutTimer = false;
     private FaceAuthServiceWrapper mService;
     private SharedUtil mShareUtil;
     private boolean mUserUnlocked = false;
@@ -79,15 +71,6 @@ public class FaceAuthService extends Service {
                 Log.d(FaceAuthService.TAG, "ALARM_TIMEOUT_FREEZED");
                 synchronized (mLockoutType) {
                     mLockoutType = LOCKOUT_TYPE_IDLE;
-                }
-            } else if (action.equals(FaceAuthService.ALARM_FAIL_TIMEOUT_LOCKOUT)) {
-                Log.d(FaceAuthService.TAG, "ALARM_FAIL_TIMEOUT_LOCKOUT");
-                cancelLockoutTimer();
-                synchronized (mLockoutType) {
-                    mLockoutType = LOCKOUT_TYPE_DISABLED;
-                }
-                synchronized (mAuthErrorCount) {
-                    mAuthErrorCount = 0;
                 }
             } else if (action.equals(Intent.ACTION_SCREEN_OFF) || action.equals(Intent.ACTION_USER_PRESENT)) {
                 mUserUnlocked = action.equals(Intent.ACTION_USER_PRESENT);
@@ -137,9 +120,6 @@ public class FaceAuthService extends Service {
                 Log.d(TAG, "onTimeout, withFace=" + withFace);
             }
             try {
-                if (withFace) {
-                    increaseAndCheckLockout();
-                }
                 if (mLockoutType != LOCKOUT_TYPE_DISABLED) {
                     sendLockoutError();
                 }else{
@@ -269,10 +249,8 @@ public class FaceAuthService extends Service {
         mUserId = Util.getUserId(this);
         mAlarmManager = getSystemService(AlarmManager.class);
         mIdleTimeoutIntent = PendingIntent.getBroadcast(getApplicationContext(), 0, new Intent(ALARM_TIMEOUT_FREEZED), PendingIntent.FLAG_IMMUTABLE);
-        mLockoutTimeoutIntent = PendingIntent.getBroadcast(getApplicationContext(), 0, new Intent(ALARM_FAIL_TIMEOUT_LOCKOUT), PendingIntent.FLAG_IMMUTABLE);
         IntentFilter intentFilter = new IntentFilter();
         intentFilter.addAction(ALARM_TIMEOUT_FREEZED);
-        intentFilter.addAction(ALARM_FAIL_TIMEOUT_LOCKOUT);
         intentFilter.addAction(Intent.ACTION_SCREEN_OFF);
         intentFilter.addAction(Intent.ACTION_USER_PRESENT);
         intentFilter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
@@ -341,50 +319,6 @@ public class FaceAuthService extends Service {
         mAlarmManager.cancel(mIdleTimeoutIntent);
     }
 
-    private void startLockoutTimer() {
-        long elapsedRealtime = SystemClock.elapsedRealtime() + FAIL_LOCKOUT_TIMEOUT_MS;
-        mOnLockoutTimer = true;
-        mAlarmManager.set(AlarmManager.ELAPSED_REALTIME, elapsedRealtime, mLockoutTimeoutIntent);
-    }
-
-    private void cancelLockoutTimer() {
-        if (mOnLockoutTimer) {
-            mAlarmManager.cancel(mLockoutTimeoutIntent);
-            mOnLockoutTimer = false;
-        }
-    }
-
-    private void increaseAndCheckLockout() {
-        if (mOnLockoutTimer || mLockoutType != LOCKOUT_TYPE_DISABLED){
-            return;
-        }
-        synchronized (mAuthErrorCount) {
-            mAuthErrorCount += 1;
-            mAuthErrorThrottleCount += 1;
-            Log.d(TAG, "increaseAndCheckLockout, mAuthErrorCount=" + mAuthErrorCount + ", mAuthErrorThrottleCount=" + mAuthErrorThrottleCount);
-            Log.d(TAG, "mUserUnlocked=" + mUserUnlocked);
-
-            if (mUserUnlocked && mAuthErrorCount == MAX_FAILED_ATTEMPTS_LOCKOUT_TIMED){
-                Log.d(TAG, "Too many attempts, lockout permanent because device is unlocked");
-                mLockoutType = LOCKOUT_TYPE_PERMANENT;
-                cancelLockoutTimer();
-            } else if (mAuthErrorThrottleCount == MAX_FAILED_ATTEMPTS_LOCKOUT_PERMANENT) {
-                synchronized (mLockoutType) {
-                    Log.d(TAG, "Too many attempts, lockout permanent");
-                    mLockoutType = LOCKOUT_TYPE_PERMANENT;
-                    cancelLockoutTimer();
-                }
-            } else if (mAuthErrorCount == MAX_FAILED_ATTEMPTS_LOCKOUT_TIMED) {
-                synchronized (mLockoutType) {
-                    Log.d(TAG, "Too many attempts, lockout for 30s");
-                    mLockoutType = LOCKOUT_TYPE_TIMED;
-                }
-                mAuthErrorCount = 0;
-                startLockoutTimer();
-            }
-        }
-    }
-
     private void updateTimersAndLockout(){
         if (mShareUtil.getIntValueByKey(AppConstants.SHARED_KEY_FACE_ID) > -1 && !mUserUnlocked) {
             if (!mOnIdleTimer){
@@ -398,12 +332,9 @@ public class FaceAuthService extends Service {
     }
 
     private void resetLockoutCount() {
-        synchronized (mAuthErrorCount) {
-            mAuthErrorCount = 0;
-            mAuthErrorThrottleCount = 0;
+        synchronized (mLockoutType) {
             mLockoutType = LOCKOUT_TYPE_DISABLED;
         }
-        cancelLockoutTimer();
     }
 
     private final class FaceAuthServiceWrapper extends IFaceService.Stub {
@@ -602,20 +533,10 @@ public class FaceAuthService extends Service {
     }
 
     private void sendLockoutError(){
-        int errorCode = 0;
-        switch (mLockoutType){
-            case LOCKOUT_TYPE_PERMANENT:
-                errorCode = BIOMETRIC_ERROR_LOCKOUT_PERMANENT;
-                break;
-            case LOCKOUT_TYPE_TIMED:
-                errorCode = BIOMETRIC_ERROR_LOCKOUT;
-                break;
-            case LOCKOUT_TYPE_IDLE:
-                errorCode = BIOMETRIC_ERROR_VENDOR;
-                break;
-        }
+        // Only the idle timeout can reach this. It is reported as a vendor error so the lockscreen
+        // simply stops scanning until the next real (PIN/pattern/password) unlock.
         try {
-            mFaceReceiver.onError(errorCode, 0);
+            mFaceReceiver.onError(BIOMETRIC_ERROR_VENDOR, 0);
         } catch (RemoteException e2) {
             e2.printStackTrace();
         }

@@ -9,7 +9,20 @@ task clean(type: Delete) {
     delete rootProject.buildDir
 }
 
-configure ([project(':faceunlock'), project(':universalauth-xposed')]) {
+// تطبيق التعرّف على الوجه (يتغيّر في هذا الإصدار)
+configure ([project(':faceunlock')]) {
+    afterEvaluate {
+        android {
+            defaultConfig {
+                versionCode 1010000
+                versionName "1.10.0"
+            }
+        }
+    }
+}
+
+// وحدة Xposed: لم يتغيّر فيها شيء ولا في بروتوكول البثّ، فيبقى رقمها كما هو (لا حاجة لإعادة تثبيتها)
+configure ([project(':universalauth-xposed')]) {
     afterEvaluate {
         android {
             defaultConfig {

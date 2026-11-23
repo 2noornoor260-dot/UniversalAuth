@@ -46,6 +46,8 @@ public class FaceUnlockVendorImpl extends Lite {
             if (ctx != null) {
                 smartEngine = new SmartFaceEngine(ctx);
                 smartEngine.initStorage(storagePath, customEncryptor);
+                // تسخين النماذج في خيط خلفي: أول فتح لا يدفع تكلفة التهيئة الباردة
+                smartEngine.warmUpAsync();
             }
         }
     }
@@ -110,13 +112,16 @@ public class FaceUnlockVendorImpl extends Lite {
     @Override
     public int prepare() {
         ensureEngine();
+        // بداية كل مسح (تحقق أو تسجيل): جلسة نظيفة تماماً، فلا تتسرّب حالة من المسح السابق
+        if (smartEngine != null) {
+            smartEngine.onScanStart();
+        }
         return 0;
     }
 
     @Override
     public int prepare(MGULKPowerMode mGULKPowerMode) {
-        ensureEngine();
-        return 0;
+        return prepare();
     }
 
     @Override
@@ -203,6 +208,13 @@ public class FaceUnlockVendorImpl extends Lite {
 
     @Override
     public int deleteFeature(int i) {
+        // الخدمة تستدعي deleteFeature(oldId) مع id>0 بعد نجاح تسجيل جديد لتنظيف القديم. المحرّك يستبدل القوالب
+        // ذرّياً عند اكتمال التسجيل، فمسحها هنا كان يحذف القوالب الجديدة التي حُفظت للتوّ (فيفشل كل تحقق لاحق).
+        // الحذف الفعلي لا يحدث إلا عند طلب الإزالة الصريح (المعرّف 0).
+        if (i != 0) {
+            Log.i(TAG, "deleteFeature(" + i + ") ignored: templates were already replaced atomically");
+            return 0;
+        }
         ensureEngine();
         if (smartEngine != null) {
             smartEngine.deleteAllTemplates();
@@ -229,6 +241,6 @@ public class FaceUnlockVendorImpl extends Lite {
 
     @Override
     public String getVersion() {
-        return "SmartFaceAI-2.0";
+        return "SmartFaceAI-3.0";
     }
     }
